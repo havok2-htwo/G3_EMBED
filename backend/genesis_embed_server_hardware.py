@@ -25,8 +25,8 @@ class RuntimeChoice:
 
 def run_probe(command: list[str]) -> tuple[int, str]:
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    except OSError:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=2.0)
+    except (OSError, subprocess.TimeoutExpired):
         return 1, ""
     output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part).strip()
     return completed.returncode, output
