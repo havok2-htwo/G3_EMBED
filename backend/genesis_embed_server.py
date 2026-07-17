@@ -163,9 +163,11 @@ def _landing_response() -> HTMLResponse:
                 <span class="eyebrow">G3_EMBED</span>
                 <h1>Lokale Text-Embeddings offen, Admin-Dashboard geschuetzt.</h1>
                 <p>
-                  Die oeffentliche API ist unter <code>POST /embed</code> und <code>POST /v1/embeddings</code>
-                  erreichbar. Das Admin-Dashboard unter <code>/admin</code> nutzt wie G3_WHISPER den Header
-                  <code>X-Admin-Key</code>.
+                  Die oeffentliche API unter <code>POST /embed</code> und <code>POST /v1/embeddings</code> ist ohne
+                  Key erreichbar, solange keine API-Keys angelegt sind. Sobald im Admin-Dashboard mindestens ein
+                  API-Key existiert, wird ein <code>X-API-Key</code>-Header verlangt. Das Admin-Dashboard unter
+                  <code>/admin</code> ist per Login (Benutzername/Passwort, Standard <code>admin</code> /
+                  <code>admin</code>, Wechsel beim ersten Login) geschuetzt.
                 </p>
                 <div class="button-row">
                   <a class="primary" href="/admin">Admin-Dashboard oeffnen</a>

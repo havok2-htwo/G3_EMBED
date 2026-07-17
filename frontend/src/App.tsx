@@ -1,27 +1,33 @@
 import { FormEvent, startTransition, useEffect, useState } from "react";
 
 import {
-  AdminKeyMetadata,
   AdminOption,
   AdminSettings,
+  ApiKeyInfo,
   BenchmarkResponse,
   CompareResponse,
+  CreatedApiKey,
   ManagedModel,
   QueueResponse,
   RuntimeInfo,
   SettingsResponse,
   StatsResponse,
+  changePassword,
   compareTexts,
+  createApiKey,
+  deleteApiKey,
   deleteModel,
   downloadModel,
-  getKeys,
   getModels,
   getQueue,
   getSettings,
   getStats,
-  rotateAdminKey,
+  listApiKeys,
+  login,
+  logout,
   runBenchmark,
   saveSettings,
+  whoami,
 } from "./api";
 
 type HistoryEntry = {
@@ -47,7 +53,8 @@ type QueuePoint = {
   textsPerSecond: number;
 };
 
-const ADMIN_KEY_STORAGE = "genesis_embed_admin_key";
+type AuthState = "loading" | "login" | "change" | "ready";
+
 const NUMBER_LOCALE = "de-DE";
 const POLL_MS = 5000;
 const MODEL_STATUS_POLL_MS = 2000;
@@ -75,28 +82,6 @@ const emptyOptions = {
   precisions: [] as AdminOption[],
   compile_modes: [] as AdminOption[],
 };
-
-function readStoredAdminKey() {
-  try {
-    return localStorage.getItem(ADMIN_KEY_STORAGE) || sessionStorage.getItem(ADMIN_KEY_STORAGE) || "";
-  } catch {
-    return "";
-  }
-}
-
-function writeStoredAdminKey(value: string) {
-  try {
-    localStorage.setItem(ADMIN_KEY_STORAGE, value);
-    sessionStorage.setItem(ADMIN_KEY_STORAGE, value);
-  } catch {}
-}
-
-function clearStoredAdminKey() {
-  try {
-    localStorage.removeItem(ADMIN_KEY_STORAGE);
-    sessionStorage.removeItem(ADMIN_KEY_STORAGE);
-  } catch {}
-}
 
 function formatValue(value: number | null | undefined, suffix = "") {
   if (value === null || value === undefined || Number.isNaN(value)) {
@@ -158,11 +143,6 @@ function resolveOptionLabel(options: AdminOption[], value: string | null | undef
 function numberFromRecord(record: Record<string, unknown>, key: string) {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function stringFromRecord(record: Record<string, unknown>, key: string) {
-  const value = record[key];
-  return typeof value === "string" ? value : "";
 }
 
 function QueueSparkline({ points }: { points: QueuePoint[] }) {
@@ -238,10 +218,25 @@ function hardwareSummary(runtime: RuntimeInfo | null) {
 }
 
 export default function App() {
-  const [adminKey, setAdminKey] = useState(readStoredAdminKey);
-  const [loginKey, setLoginKey] = useState(readStoredAdminKey);
-  const [authorized, setAuthorized] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [authState, setAuthState] = useState<AuthState>("loading");
+  const [currentUser, setCurrentUser] = useState("");
+  const [loginUsername, setLoginUsername] = useState("admin");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+
+  const [pwCurrent, setPwCurrent] = useState("");
+  const [pwNew, setPwNew] = useState("");
+  const [pwConfirm, setPwConfirm] = useState("");
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwError, setPwError] = useState("");
+  const [pwMessage, setPwMessage] = useState("");
+
+  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[]>([]);
+  const [newKeyAlias, setNewKeyAlias] = useState("");
+  const [createdKey, setCreatedKey] = useState<CreatedApiKey | null>(null);
+  const [apiKeyBusy, setApiKeyBusy] = useState(false);
+
   const [globalError, setGlobalError] = useState("");
   const [actionMessage, setActionMessage] = useState("");
   const [settingsForm, setSettingsForm] = useState<AdminSettings>(emptySettings);
@@ -251,8 +246,6 @@ export default function App() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [queue, setQueue] = useState<QueueResponse | null>(null);
   const [queueHistory, setQueueHistory] = useState<QueuePoint[]>([]);
-  const [adminMetadata, setAdminMetadata] = useState<AdminKeyMetadata | null>(null);
-  const [newlyCreatedKey, setNewlyCreatedKey] = useState<(AdminKeyMetadata & { token: string }) | null>(null);
   const [saveBusy, setSaveBusy] = useState(false);
   const [modelBusyId, setModelBusyId] = useState("");
   const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
@@ -266,6 +259,7 @@ export default function App() {
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
   const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkResponse | null>(null);
 
+  const isReady = authState === "ready";
   const hasDownloadingModels = managedModels.some((model) => model.status === "downloading");
   const history = (stats?.history ?? []) as HistoryEntry[];
 
@@ -286,122 +280,187 @@ export default function App() {
     setQueueHistory((current) => [...current.slice(-(HISTORY_POINTS - 1)), point]);
   }
 
-  async function refreshDashboard(currentAdminKey = adminKey) {
-    if (!currentAdminKey) {
-      return;
+  function resetDashboardState() {
+    startTransition(() => {
+      setStats(null);
+      setQueue(null);
+      setRuntime(null);
+      setManagedModels([]);
+      setSettingsForm(emptySettings);
+      setSettingsOptions(emptyOptions);
+      setApiKeys([]);
+      setCreatedKey(null);
+      setActionMessage("");
+      setGlobalError("");
+      setCompareResult(null);
+      setBenchmarkResult(null);
+    });
+  }
+
+  function handleApiError(error: unknown, fallback: string): boolean {
+    const message = error instanceof Error ? error.message : "";
+    if (message === "unauthorized") {
+      resetDashboardState();
+      setAuthState("login");
+      setAuthError("Your session has expired. Please sign in again.");
+      return true;
     }
+    if (message === "password_change_required") {
+      setAuthState("change");
+      return true;
+    }
+    setGlobalError(error instanceof Error ? error.message : fallback);
+    return false;
+  }
+
+  async function refreshDashboard() {
     try {
       const [settingsResponse, statsResponse, queueResponse, keysResponse] = await Promise.all([
-        getSettings(currentAdminKey),
-        getStats(currentAdminKey),
-        getQueue(currentAdminKey),
-        getKeys(currentAdminKey),
+        getSettings(),
+        getStats(),
+        getQueue(),
+        listApiKeys(),
       ]);
       startTransition(() => {
         applySettings(settingsResponse);
         setStats(statsResponse);
         setQueue(queueResponse);
-        setAdminMetadata(keysResponse.admin_key);
+        setApiKeys(keysResponse.keys);
         recordQueuePoint(queueResponse);
         setGlobalError("");
       });
     } catch (error) {
-      if (error instanceof Error && error.message === "unauthorized") {
-        setAuthorized(false);
-        clearStoredAdminKey();
-      }
-      setGlobalError(error instanceof Error ? error.message : "Dashboard refresh failed.");
+      handleApiError(error, "Dashboard refresh failed.");
     }
   }
 
+  // Bootstrap: check the admin session on mount.
   useEffect(() => {
-    if (!adminKey) {
-      return;
-    }
-    setLoading(true);
-    Promise.all([getSettings(adminKey), getKeys(adminKey)])
-      .then(([settingsResponse, keysResponse]) => {
-        writeStoredAdminKey(adminKey);
-        applySettings(settingsResponse);
-        setAdminMetadata(keysResponse.admin_key);
-        setAuthorized(true);
-        void refreshDashboard(adminKey);
-      })
-      .catch(() => {
-        setAuthorized(false);
-      })
-      .finally(() => setLoading(false));
+    let cancelled = false;
+    (async () => {
+      try {
+        const me = await whoami();
+        if (cancelled) return;
+        setCurrentUser(me.username);
+        setAuthState(me.must_change_password ? "change" : "ready");
+      } catch {
+        if (!cancelled) setAuthState("login");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    if (!authorized || !adminKey) {
-      return;
-    }
+    if (!isReady) return;
+    void refreshDashboard();
     const interval = window.setInterval(() => {
-      void refreshDashboard(adminKey);
+      void refreshDashboard();
     }, POLL_MS);
     return () => window.clearInterval(interval);
-  }, [authorized, adminKey]);
+  }, [authState]);
 
   useEffect(() => {
-    if (!authorized || !adminKey || !hasDownloadingModels) {
+    if (!isReady || !hasDownloadingModels) {
       return;
     }
     const interval = window.setInterval(() => {
       void refreshModels();
     }, MODEL_STATUS_POLL_MS);
     return () => window.clearInterval(interval);
-  }, [authorized, adminKey, hasDownloadingModels, settingsForm.model_cache_path]);
+  }, [authState, hasDownloadingModels, settingsForm.model_cache_path]);
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const candidate = loginKey.trim();
-    if (!candidate) {
-      setGlobalError("Admin key is required.");
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const me = await login(loginUsername.trim(), loginPassword);
+      setCurrentUser(me.username);
+      setLoginPassword("");
+      setAuthState(me.must_change_password ? "change" : "ready");
+    } catch (error) {
+      setAuthError(
+        error instanceof Error && error.message === "unauthorized"
+          ? "Invalid username or password."
+          : error instanceof Error
+            ? error.message
+            : "Login failed.",
+      );
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleChangePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPwError("");
+    setPwMessage("");
+    if (pwNew.length < 4) {
+      setPwError("The new password must be at least 4 characters.");
       return;
     }
-    setLoading(true);
-    setGlobalError("");
+    if (pwNew !== pwConfirm) {
+      setPwError("The new password and its confirmation do not match.");
+      return;
+    }
+    setPwBusy(true);
     try {
-      const [settingsResponse, keysResponse] = await Promise.all([getSettings(candidate), getKeys(candidate)]);
-      writeStoredAdminKey(candidate);
-      setAdminKey(candidate);
-      applySettings(settingsResponse);
-      setAdminMetadata(keysResponse.admin_key);
-      setAuthorized(true);
-      await refreshDashboard(candidate);
+      await changePassword(pwCurrent, pwNew);
+      setPwCurrent("");
+      setPwNew("");
+      setPwConfirm("");
+      setPwMessage("Password updated.");
+      setAuthState("ready");
     } catch (error) {
-      setGlobalError(error instanceof Error && error.message === "unauthorized" ? "Invalid admin key." : "Login failed.");
+      setPwError(error instanceof Error ? error.message : "Password change failed.");
     } finally {
-      setLoading(false);
+      setPwBusy(false);
     }
   }
 
-  function handleLogout() {
-    clearStoredAdminKey();
-    setAuthorized(false);
-    setAdminKey("");
-    setLoginKey("");
-    setStats(null);
-    setQueue(null);
-    setRuntime(null);
-    setManagedModels([]);
-    setNewlyCreatedKey(null);
+  async function handleLogout() {
+    try {
+      await logout();
+    } catch {
+      // clear locally regardless
+    }
+    resetDashboardState();
+    setLoginPassword("");
+    setAuthState("login");
   }
 
-  async function handleRotateKey() {
+  async function handleCreateApiKey(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setApiKeyBusy(true);
     setActionMessage("");
     setGlobalError("");
     try {
-      const response = await rotateAdminKey(adminKey);
-      setNewlyCreatedKey(response.key);
-      setAdminMetadata(response.keys.admin_key);
-      setAdminKey(response.key.token);
-      setLoginKey(response.key.token);
-      writeStoredAdminKey(response.key.token);
-      setActionMessage("Admin key rotated. The new key is active locally.");
+      const created = await createApiKey(newKeyAlias.trim());
+      setCreatedKey(created);
+      setNewKeyAlias("");
+      setActionMessage(`API key "${created.alias}" created. Copy it now — it is shown only once.`);
+      const keysResponse = await listApiKeys();
+      setApiKeys(keysResponse.keys);
     } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "The admin key could not be rotated.");
+      handleApiError(error, "The API key could not be created.");
+    } finally {
+      setApiKeyBusy(false);
+    }
+  }
+
+  async function handleDeleteApiKey(keyId: string, alias: string) {
+    setActionMessage("");
+    setGlobalError("");
+    try {
+      await deleteApiKey(keyId);
+      setCreatedKey((current) => (current?.id === keyId ? null : current));
+      setActionMessage(`API key "${alias}" deleted.`);
+      const keysResponse = await listApiKeys();
+      setApiKeys(keysResponse.keys);
+    } catch (error) {
+      handleApiError(error, "The API key could not be deleted.");
     }
   }
 
@@ -411,27 +470,27 @@ export default function App() {
     setActionMessage("");
     setGlobalError("");
     try {
-      const response = await saveSettings(adminKey, settingsForm);
+      const response = await saveSettings(settingsForm);
       applySettings(response);
       setActionMessage("Settings saved.");
     } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "Settings could not be saved.");
+      handleApiError(error, "Settings could not be saved.");
     } finally {
       setSaveBusy(false);
     }
   }
 
   async function refreshModels() {
-    if (!adminKey) {
+    if (!isReady) {
       return;
     }
     setModelBusyId("__refresh__");
     setModelActionKind("refresh");
     try {
-      const response = await getModels(adminKey, settingsForm.model_cache_path);
+      const response = await getModels(settingsForm.model_cache_path);
       setManagedModels(response.models ?? []);
     } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "Model refresh failed.");
+      handleApiError(error, "Model refresh failed.");
     } finally {
       setModelBusyId("");
       setModelActionKind(null);
@@ -443,10 +502,10 @@ export default function App() {
     setModelActionKind("download");
     setGlobalError("");
     try {
-      const response = await downloadModel(adminKey, model.id, settingsForm.model_cache_path, settingsForm.huggingface_token);
+      const response = await downloadModel(model.id, settingsForm.model_cache_path, settingsForm.huggingface_token);
       setManagedModels(response.models ?? []);
     } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "Model download failed.");
+      handleApiError(error, "Model download failed.");
     } finally {
       setModelBusyId("");
       setModelActionKind(null);
@@ -458,10 +517,10 @@ export default function App() {
     setModelActionKind("delete");
     setGlobalError("");
     try {
-      const response = await deleteModel(adminKey, model.id, settingsForm.model_cache_path);
+      const response = await deleteModel(model.id, settingsForm.model_cache_path);
       setManagedModels(response.models ?? []);
     } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "Model delete failed.");
+      handleApiError(error, "Model delete failed.");
     } finally {
       setModelBusyId("");
       setModelActionKind(null);
@@ -474,12 +533,12 @@ export default function App() {
     setCompareResult(null);
     setGlobalError("");
     try {
-      const result = await compareTexts(adminKey, compareModel, compareTextA, compareTextB);
+      const result = await compareTexts(compareModel, compareTextA, compareTextB);
       setCompareResult(result);
       setActionMessage(`Compared ${result.dimension} dimensions in ${formatValue(result.total_duration_ms, " ms")}.`);
-      await refreshDashboard(adminKey);
+      await refreshDashboard();
     } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "Compare failed.");
+      handleApiError(error, "Compare failed.");
     } finally {
       setCompareBusy(false);
     }
@@ -496,11 +555,11 @@ export default function App() {
     setBenchmarkResult(null);
     setGlobalError("");
     try {
-      const result = await runBenchmark(adminKey, compareModel, inputs, benchmarkRepeatCount);
+      const result = await runBenchmark(compareModel, inputs, benchmarkRepeatCount);
       setBenchmarkResult(result);
       setActionMessage(`Benchmark finished: ${formatValue(result.total_texts)} texts in ${formatValue(result.total_wall_time_ms, " ms")}.`);
     } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : "Benchmark failed.");
+      handleApiError(error, "Benchmark failed.");
     } finally {
       setBenchmarkBusy(false);
     }
@@ -510,28 +569,76 @@ export default function App() {
     setSettingsForm((current) => ({ ...current, [key]: value }));
   }
 
-  if (!authorized) {
+  if (authState === "loading") {
     return (
-      <main className="centered">
+      <main className="shell centered">
         <section className="panel login-panel">
-          <div>
-            <span className="eyebrow">G3_EMBED Admin</span>
-            <h1>Embedding server control room</h1>
-            <p>Enter the startup or persistent admin key to manage models, hardware routing, batching, and local test runs.</p>
+          <p className="message">Loading...</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (authState === "login") {
+    return (
+      <main className="shell centered">
+        <section className="panel login-panel">
+          <div className="hero-copy">
+            <span className="eyebrow">Private Access</span>
+            <h1>G3_EMBED Admin</h1>
+            <p>
+              The public embedding API stays open until you create an API key. The private dashboard for models,
+              hardware routing, batching, and local test runs is protected by a username and password login.
+            </p>
           </div>
           <form className="login-form" onSubmit={handleLogin}>
             <label>
-              <span>Admin Key</span>
-              <input
-                type="password"
-                value={loginKey}
-                onChange={(event) => setLoginKey(event.target.value)}
-                placeholder="genesis_embed_admin_..."
-                autoFocus
-              />
+              <span>Username</span>
+              <input value={loginUsername} autoComplete="username" onChange={(event) => setLoginUsername(event.target.value)} placeholder="admin" />
             </label>
-            <button type="submit" disabled={loading}>{loading ? "Checking..." : "Open Dashboard"}</button>
-            {globalError ? <p className="message error">{globalError}</p> : null}
+            <label>
+              <span>Password</span>
+              <input type="password" value={loginPassword} autoComplete="current-password" onChange={(event) => setLoginPassword(event.target.value)} placeholder="admin" />
+            </label>
+            <button type="submit" disabled={authBusy || !loginUsername.trim() || !loginPassword}>
+              {authBusy ? "Signing in..." : "Sign In"}
+            </button>
+            <p className="message">Default credentials: admin / admin. You must change the password on first login.</p>
+            {authError ? <p className="message error">{authError}</p> : null}
+          </form>
+        </section>
+      </main>
+    );
+  }
+
+  if (authState === "change") {
+    return (
+      <main className="shell centered">
+        <section className="panel login-panel">
+          <div className="hero-copy">
+            <span className="eyebrow">Security</span>
+            <h1>Set a New Password</h1>
+            <p>You are signed in as <strong>{currentUser || "admin"}</strong>. Choose a new password before continuing.</p>
+          </div>
+          <form className="login-form" onSubmit={handleChangePassword}>
+            <label>
+              <span>Current Password</span>
+              <input type="password" value={pwCurrent} autoComplete="current-password" onChange={(event) => setPwCurrent(event.target.value)} />
+            </label>
+            <label>
+              <span>New Password</span>
+              <input type="password" value={pwNew} autoComplete="new-password" onChange={(event) => setPwNew(event.target.value)} />
+            </label>
+            <label>
+              <span>Confirm New Password</span>
+              <input type="password" value={pwConfirm} autoComplete="new-password" onChange={(event) => setPwConfirm(event.target.value)} />
+            </label>
+            <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm}>
+              {pwBusy ? "Saving..." : "Save New Password"}
+            </button>
+            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Cancel & Sign Out</button>
+            {pwMessage ? <p className="message">{pwMessage}</p> : null}
+            {pwError ? <p className="message error">{pwError}</p> : null}
           </form>
         </section>
       </main>
@@ -549,7 +656,7 @@ export default function App() {
         <div className="hero-actions">
           <a className="secondary-link" href="/docs">OpenAPI</a>
           <button type="button" className="secondary-button" onClick={() => void refreshDashboard()}>Refresh</button>
-          <button type="button" className="ghost-button" onClick={handleLogout}>Logout</button>
+          <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Logout</button>
         </div>
       </header>
 
@@ -573,9 +680,68 @@ export default function App() {
           <small>{formatValue(stats?.summary.avg_total_duration_ms, " ms")} avg total</small>
         </div>
         <div className="stat-card">
-          <span>Queue</span>
-          <strong>{formatValue(queue?.queue_size ?? 0)}</strong>
-          <small>{formatValue(queue?.last_batch_texts_per_second, " texts/s")}</small>
+          <span>Signed in as</span>
+          <strong>{currentUser || "admin"}</strong>
+          <small>{formatValue(queue?.queue_size ?? 0)} in queue</small>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">Account & API Keys</span>
+            <h2>Access</h2>
+          </div>
+        </div>
+        <div className="panel-grid">
+          <form className="settings-form" onSubmit={handleChangePassword}>
+            <span className="eyebrow full-width">Change password ({currentUser || "admin"})</span>
+            <label className="full-width"><span>Current Password</span><input type="password" value={pwCurrent} onChange={(event) => setPwCurrent(event.target.value)} /></label>
+            <label className="full-width"><span>New Password</span><input type="password" value={pwNew} onChange={(event) => setPwNew(event.target.value)} /></label>
+            <label className="full-width"><span>Confirm</span><input type="password" value={pwConfirm} onChange={(event) => setPwConfirm(event.target.value)} /></label>
+            <div className="form-actions full-width">
+              <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm}>{pwBusy ? "Saving..." : "Change Password"}</button>
+              {pwMessage ? <p className="message">{pwMessage}</p> : null}
+              {pwError ? <p className="message error">{pwError}</p> : null}
+            </div>
+          </form>
+          <div className="side-panel">
+            <span className="eyebrow full-width">API Keys</span>
+            <p className="section-copy">
+              While no key exists, <code>POST /embed</code> and <code>POST /v1/embeddings</code> are open. Once one key
+              exists, a valid <code>X-API-Key</code> header is required. Usage counts processed texts per key.
+            </p>
+            {createdKey ? (
+              <div className="key-token-card">
+                <strong>{createdKey.alias}</strong>
+                <p>Copy this key now — it is shown only once.</p>
+                <div className="key-token-value mono">{createdKey.token}</div>
+                <button type="button" className="secondary-button" onClick={() => void copyTextToClipboard(createdKey.token)}>Copy</button>
+              </div>
+            ) : null}
+            <form className="benchmark-form" onSubmit={handleCreateApiKey}>
+              <label className="full-width"><span>Alias</span><input value={newKeyAlias} onChange={(event) => setNewKeyAlias(event.target.value)} placeholder="e.g. Key fuer Projekt X" /></label>
+              <div className="form-actions"><button type="submit" disabled={apiKeyBusy || !newKeyAlias.trim()}>{apiKeyBusy ? "Creating..." : "Create API Key"}</button></div>
+            </form>
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Alias</th><th>Created</th><th>Texts</th><th>Requests</th><th>Last Used</th><th></th></tr></thead>
+                <tbody>
+                  {apiKeys.length === 0 ? <tr><td colSpan={6}>No API keys — the public API is currently open.</td></tr> : null}
+                  {apiKeys.map((key) => (
+                    <tr key={key.id}>
+                      <td>{key.alias}</td>
+                      <td>{formatDateTime(key.created_at)}</td>
+                      <td>{formatValue(key.usage.total_items_processed)}</td>
+                      <td>{key.usage.request_count}</td>
+                      <td>{formatDateTime(key.usage.last_used_at)}</td>
+                      <td><button type="button" className="ghost-button danger-button" onClick={() => void handleDeleteApiKey(key.id, key.alias)}>Delete</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -611,11 +777,7 @@ export default function App() {
             <div className="form-actions full-width">
               <button type="submit" disabled={compareBusy}>{compareBusy ? "Embedding..." : "Embed & Compare"}</button>
               {compareResult ? (
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => void copyTextToClipboard(JSON.stringify(compareResult.vectors, null, 2))}
-                >
+                <button type="button" className="secondary-button" onClick={() => void copyTextToClipboard(JSON.stringify(compareResult.vectors, null, 2))}>
                   Copy Vectors
                 </button>
               ) : null}
@@ -739,35 +901,14 @@ export default function App() {
         <section className="panel">
           <div className="section-heading">
             <div>
-              <span className="eyebrow">Admin Key</span>
-              <h2>Access</h2>
+              <span className="eyebrow">Benchmark</span>
+              <h2>Throughput test</h2>
             </div>
           </div>
-          {newlyCreatedKey ? (
-            <div className="key-token-card">
-              <strong>New key</strong>
-              <p>The server returns this token only once.</p>
-              <div className="key-token-value mono">{newlyCreatedKey.token}</div>
-              <button type="button" className="secondary-button" onClick={() => void copyTextToClipboard(newlyCreatedKey.token)}>Copy Key</button>
-            </div>
-          ) : null}
-          <div className="key-token-card">
-            <strong>{adminMetadata?.label || "Master Admin Key"}</strong>
-            <p>Created {formatDateTime(adminMetadata?.created_at)} | last used {formatDateTime(adminMetadata?.last_used_at)}</p>
-            <div className="key-token-value mono">{adminKey}</div>
-            <div className="button-row">
-              <button type="button" className="secondary-button" onClick={() => void copyTextToClipboard(adminKey)}>Copy Active Key</button>
-              <button type="button" className="ghost-button danger-button" onClick={() => void handleRotateKey()}>Rotate Admin Key</button>
-            </div>
-          </div>
-
-          <div className="panel-divider" />
-
           <form className="benchmark-form" onSubmit={handleBenchmark}>
-            <span className="eyebrow full-width">Benchmark</span>
             <label className="full-width">
               <span>Inputs</span>
-              <textarea value={benchmarkInputs} onChange={(event) => setBenchmarkInputs(event.target.value)} rows={5} />
+              <textarea value={benchmarkInputs} onChange={(event) => setBenchmarkInputs(event.target.value)} rows={6} />
             </label>
             <label>
               <span>Repeats</span>

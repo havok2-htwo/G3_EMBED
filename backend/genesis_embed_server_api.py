@@ -7,6 +7,7 @@ from typing import Any, List, Union
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from .genesis_embed_server_auth import authorize_api_key, get_auth_store
 from .genesis_embed_server_globals import MODEL_OPTIONS, batch_history, current_settings, embedding_history, history_lock, settings_lock
 from .genesis_embed_server_runtime import EncodeResult, encode_texts, get_runtime_status
 from .genesis_embed_server_storage import log_embedding
@@ -157,12 +158,15 @@ def create_api(app: FastAPI) -> FastAPI:
 
     @app.post("/embed", response_model=EmbedResponse)
     async def embed(request: Request, payload: EmbedRequest):
+        api_key_id = authorize_api_key(request)
         result, batched = await embed_texts_for_request(
             request,
             model_id=payload.model,
             inputs=_normalize_inputs(payload.inputs),
             route="/embed",
         )
+        if api_key_id:
+            get_auth_store().record_api_key_usage(api_key_id, result.input_count)
         return _result_to_response(result, batched=batched)
 
     @app.get("/v1/models")
@@ -182,12 +186,15 @@ def create_api(app: FastAPI) -> FastAPI:
 
     @app.post("/v1/embeddings")
     async def v1_embeddings(request: Request, payload: OpenAIEmbeddingRequest):
+        api_key_id = authorize_api_key(request)
         result, _ = await embed_texts_for_request(
             request,
             model_id=payload.model,
             inputs=_normalize_inputs(payload.input),
             route="/v1/embeddings",
         )
+        if api_key_id:
+            get_auth_store().record_api_key_usage(api_key_id, result.input_count)
         approximate_tokens = max(1, result.input_chars // 4)
         return {
             "object": "list",
