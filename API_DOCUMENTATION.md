@@ -1,8 +1,14 @@
 # G3_EMBED API Documentation
 
-Base URL: `http://127.0.0.1:8770`
+Base URL: `http://127.0.0.1:8777`
 
 ## Public Routes
+
+Public embedding routes are open until at least one client API key is configured. Once keys exist, callers must provide:
+
+```http
+X-API-Key: g3_embed_...
+```
 
 ### `GET /health`
 
@@ -64,19 +70,55 @@ Response uses OpenAI's `object`, `data`, `model`, and `usage` shape. Embeddings 
 
 ## Admin Routes
 
-All admin routes require:
+Admin routes use username/password login and an httpOnly session cookie. The default first-run login is `admin` / `admin`, and the password must be changed before protected admin actions are available.
 
-```http
-X-Admin-Key: genesis_embed_admin_...
+### `POST /api/admin/auth/login`
+
+Creates a browser session.
+
+```json
+{
+  "username": "admin",
+  "password": "admin"
+}
 ```
 
-### `GET /api/admin/keys`
+### `POST /api/admin/auth/change-password`
 
-Returns metadata for the active persistent admin key.
+Changes the current admin password and refreshes the session.
 
-### `POST /api/admin/keys`
+```json
+{
+  "current_password": "admin",
+  "new_password": "new-password"
+}
+```
 
-Rotates the persistent admin key and returns the new plaintext token once.
+### `GET /api/admin/auth/whoami`
+
+Returns the current session user and password-change state.
+
+### `POST /api/admin/auth/logout`
+
+Clears the current browser session.
+
+### `GET /api/admin/api-keys`
+
+Returns metadata for configured client API keys.
+
+### `POST /api/admin/api-keys`
+
+Creates a client API key and returns the plaintext token once.
+
+```json
+{
+  "alias": "local-client"
+}
+```
+
+### `DELETE /api/admin/api-keys/{key_id}`
+
+Deletes a client API key.
 
 ### `GET /api/admin/settings`
 

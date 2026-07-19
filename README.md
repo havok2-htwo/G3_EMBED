@@ -2,16 +2,15 @@
 
 `G3_EMBED` is a local FastAPI + React/Vite embedding server extracted from the Genesis3 memory-vector path and shaped like `G3_WHISPER`.
 
-It serves the public embedding API, OpenAPI docs, landing page, and protected admin dashboard from one process on port `8770`.
+It serves the public embedding API, OpenAPI docs, landing page, and protected admin dashboard from one process on port `8777`.
 
 ## Features
 
 - Genesis-compatible `POST /embed`
 - OpenAI-compatible `POST /v1/embeddings` and `GET /v1/models`
 - `GET /health` with runtime and hardware status
-- Admin dashboard at `/admin`, protected by `X-Admin-Key`
-- Persistent hashed admin key plus temporary startup key
-- Admin key rotation
+- Admin dashboard at `/admin`, protected by username/password login
+- Admin-managed client API keys for public endpoints
 - Model dropdown and cache manager
 - Dynamic batching by `(model_id, backend, target, precision)`
 - Hybrid runtime selection:
@@ -49,27 +48,23 @@ Linux/macOS:
 bash ./start.sh
 ```
 
-The scripts create `venv`, install a suitable PyTorch backend, install Python and frontend dependencies, build the frontend, generate a temporary startup admin key, and start the server.
+The scripts create `venv`, install a suitable PyTorch backend, install Python and frontend dependencies, build the frontend, and start the server.
 
 Default URLs:
 
-- Landing page: `http://127.0.0.1:8770/`
-- Admin dashboard: `http://127.0.0.1:8770/admin`
-- OpenAPI docs: `http://127.0.0.1:8770/docs`
-- Native API: `POST http://127.0.0.1:8770/embed`
+- Landing page: `http://127.0.0.1:8777/`
+- Admin dashboard: `http://127.0.0.1:8777/admin`
+- OpenAPI docs: `http://127.0.0.1:8777/docs`
+- Native API: `POST http://127.0.0.1:8777/embed`
 
-## Admin Keys
+## Admin Login and Client API Keys
 
-All `/api/admin/*` routes require `X-Admin-Key`.
+Admin users log in at `/admin` with a username and password. The default first-run login is `admin` / `admin`, and the server requires changing that password before protected admin actions are available.
 
-The persistent key is stored hashed in `logs/genesis_embed_secrets.json`. A temporary startup key is printed by `start.bat` / `start.sh` and expires server-side after `GENESIS_STARTUP_ADMIN_KEY_TTL_SECONDS`, defaulting to `300`.
+Client API keys are managed from the admin dashboard. Public embedding endpoints remain open until at least one client key exists; once keys exist, callers must send `X-API-Key`.
 
 Optional environment variables:
 
-- `GENESIS_EMBED_ADMIN_KEY`: bootstrap persistent key on first run
-- `GENESIS_ADMIN_KEY`: shared bootstrap fallback
-- `GENESIS_STARTUP_ADMIN_KEY_TTL_SECONDS`
-- `GENESIS_STARTUP_ADMIN_KEY_DISPLAY_SECONDS`
 - `GENESIS_TORCH_VARIANT=auto|cpu|cuda|xpu`
 - `HUGGINGFACE_TOKEN` or `HF_TOKEN`
 
