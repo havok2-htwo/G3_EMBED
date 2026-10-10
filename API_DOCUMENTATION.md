@@ -136,7 +136,10 @@ Updates settings:
 - `batch_wait_time_ms`
 - `batch_max_texts`
 - `batch_max_chars`
+- `encode_batch_size` (texts per forward pass, `0` = model default)
+- `max_seq_length` (token truncation per text, `0` = model default, clamped to the model's native limit)
 - `precision`
+- `quantization` (`none`, `int8`, `nf4`; PyTorch CUDA only)
 - `compile_mode`
 - `warmup_on_load`
 - `huggingface_token`

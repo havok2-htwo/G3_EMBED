@@ -69,6 +69,42 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "recommended_backend": "cuda",
         "notes": "Large experimental model for high-VRAM tests.",
     },
+    "Qwen/Qwen3-Embedding-0.6B": {
+        "label": "Qwen3 Embedding 0.6B",
+        "family": "Qwen3",
+        "tier": "stable",
+        "approx_size_gb": 1.2,
+        "dimensions": 1024,
+        "recommended_backend": "cuda",
+        "preferred_dtype": "bfloat16",
+        "default_max_seq_length": 4096,
+        "default_encode_batch_size": 2,
+        "notes": "Long-context (32k) multilingual model with E5-Large dimensions. ~1.7 GB VRAM at 4096 tokens, batch 1.",
+    },
+    "Qwen/Qwen3-Embedding-4B": {
+        "label": "Qwen3 Embedding 4B",
+        "family": "Qwen3",
+        "tier": "stable",
+        "approx_size_gb": 8.1,
+        "dimensions": 2560,
+        "recommended_backend": "cuda",
+        "preferred_dtype": "bfloat16",
+        "default_max_seq_length": 4096,
+        "default_encode_batch_size": 2,
+        "notes": "VRAM at 4096 tokens, batch 1: ~8.7 GB BF16, ~3.8 GB NF4.",
+    },
+    "Qwen/Qwen3-Embedding-8B": {
+        "label": "Qwen3 Embedding 8B",
+        "family": "Qwen3",
+        "tier": "experimental-xl",
+        "approx_size_gb": 15.1,
+        "dimensions": 4096,
+        "recommended_backend": "cuda",
+        "preferred_dtype": "bfloat16",
+        "default_max_seq_length": 4096,
+        "default_encode_batch_size": 2,
+        "notes": "VRAM at 4096 tokens, batch 1: ~15.4 GB BF16, ~9 GB INT8, ~5.5-7 GB NF4.",
+    },
 }
 
 MODEL_OPTIONS = [{"label": spec["label"], "value": model_id} for model_id, spec in MODEL_SPECS.items()]
@@ -93,6 +129,14 @@ PRECISION_OPTIONS = [
     {"label": "Float16", "value": "float16"},
     {"label": "BFloat16", "value": "bfloat16"},
 ]
+
+QUANTIZATION_OPTIONS = [
+    {"label": "None", "value": "none"},
+    {"label": "INT8 (bitsandbytes)", "value": "int8"},
+    {"label": "NF4 4-bit (bitsandbytes)", "value": "nf4"},
+]
+
+MAX_SEQ_LENGTH_LIMIT = 32768
 
 COMPILE_OPTIONS = [
     {"label": "Off", "value": "off"},

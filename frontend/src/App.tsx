@@ -69,7 +69,10 @@ const emptySettings: AdminSettings = {
   batch_wait_time_ms: 25,
   batch_max_texts: 32,
   batch_max_chars: 64000,
+  encode_batch_size: 0,
+  max_seq_length: 0,
   precision: "auto",
+  quantization: "none",
   compile_mode: "off",
   warmup_on_load: false,
   huggingface_token: "",
@@ -80,6 +83,7 @@ const emptyOptions = {
   execution_targets: [] as AdminOption[],
   backends: [] as AdminOption[],
   precisions: [] as AdminOption[],
+  quantizations: [] as AdminOption[],
   compile_modes: [] as AdminOption[],
 };
 
@@ -857,6 +861,14 @@ export default function App() {
               </select>
             </label>
             <label>
+              <span>Quantization (CUDA)</span>
+              <select value={settingsForm.quantization} onChange={(event) => updateSetting("quantization", event.target.value)}>
+                {settingsOptions.quantizations.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <label>
               <span>Compile</span>
               <select value={settingsForm.compile_mode} onChange={(event) => updateSetting("compile_mode", event.target.value)}>
                 {settingsOptions.compile_modes.map((option) => (
@@ -875,6 +887,14 @@ export default function App() {
             <label>
               <span>Max Chars</span>
               <input type="number" min={256} value={settingsForm.batch_max_chars} onChange={(event) => updateSetting("batch_max_chars", Number(event.target.value))} />
+            </label>
+            <label>
+              <span>GPU Batch Size (0 = auto)</span>
+              <input type="number" min={0} value={settingsForm.encode_batch_size} onChange={(event) => updateSetting("encode_batch_size", Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Max Tokens / Text (0 = model default)</span>
+              <input type="number" min={0} step={256} value={settingsForm.max_seq_length} onChange={(event) => updateSetting("max_seq_length", Number(event.target.value))} />
             </label>
             <label className="full-width">
               <span>Cache Path</span>

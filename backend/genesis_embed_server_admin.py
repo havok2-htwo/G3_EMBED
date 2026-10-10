@@ -22,6 +22,7 @@ from .genesis_embed_server_globals import (
     EXECUTION_TARGET_OPTIONS,
     MODEL_OPTIONS,
     PRECISION_OPTIONS,
+    QUANTIZATION_OPTIONS,
     batch_history,
     current_settings,
     embedding_history,
@@ -43,7 +44,10 @@ class AdminSettingsPayload(BaseModel):
     batch_wait_time_ms: int
     batch_max_texts: int
     batch_max_chars: int
+    encode_batch_size: int = 0
+    max_seq_length: int = 0
     precision: str
+    quantization: str = "none"
     compile_mode: str
     warmup_on_load: bool
     huggingface_token: str
@@ -92,6 +96,7 @@ def _settings_options() -> Dict[str, List[Dict[str, str]]]:
         "execution_targets": EXECUTION_TARGET_OPTIONS,
         "backends": BACKEND_OPTIONS,
         "precisions": PRECISION_OPTIONS,
+        "quantizations": QUANTIZATION_OPTIONS,
         "compile_modes": COMPILE_OPTIONS,
     }
 

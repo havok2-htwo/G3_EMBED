@@ -12,7 +12,10 @@ export type AdminSettings = {
   batch_wait_time_ms: number;
   batch_max_texts: number;
   batch_max_chars: number;
+  encode_batch_size: number;
+  max_seq_length: number;
   precision: string;
+  quantization: string;
   compile_mode: string;
   warmup_on_load: boolean;
   huggingface_token: string;
@@ -66,6 +69,7 @@ export type SettingsResponse = {
     execution_targets: AdminOption[];
     backends: AdminOption[];
     precisions: AdminOption[];
+    quantizations: AdminOption[];
     compile_modes: AdminOption[];
   };
   models: ManagedModel[];

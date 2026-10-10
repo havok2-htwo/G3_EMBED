@@ -9,3 +9,5 @@ transformers>=4.57,<5.0
 safetensors>=0.4,<1.0
 openvino>=2025.0,<2027.0
 optimum-intel[openvino]>=1.24,<2.0
+accelerate>=1.0,<2.0
+bitsandbytes>=0.45,<1.0; platform_system != "Darwin"
