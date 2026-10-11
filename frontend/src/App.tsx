@@ -61,7 +61,7 @@ const MODEL_STATUS_POLL_MS = 2000;
 const HISTORY_POINTS = 72;
 
 const emptySettings: AdminSettings = {
-  default_model: "intfloat/multilingual-e5-small",
+  default_model: "google/embeddinggemma-2",
   execution_target: "auto",
   backend_override: "auto",
   model_cache_path: ".\\models",

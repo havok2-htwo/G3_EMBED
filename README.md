@@ -19,13 +19,15 @@ It serves the public embedding API, OpenAPI docs, landing page, and protected ad
   - `intel_npu`: OpenVINO NPU
   - `intel_igpu`: OpenVINO GPU, then PyTorch XPU fallback
   - `cpu`: CPU fallback
+  - OpenVINO targets are currently unavailable (see [OpenVINO](#openvino)); they fall back to PyTorch.
 - Embedding Lab with two-text vector generation, cosine similarity, dot product, distance, timings, and raw vector copy
 
 ## Models
 
 The v1 model catalog is intentionally curated:
 
-- `intfloat/multilingual-e5-small` default
+- `google/embeddinggemma-2` default (768 dims, 8k context)
+- `intfloat/multilingual-e5-small`
 - `intfloat/multilingual-e5-base`
 - `intfloat/multilingual-e5-large`
 - `BAAI/bge-m3`
@@ -33,7 +35,9 @@ The v1 model catalog is intentionally curated:
 - `BAAI/bge-multilingual-gemma2` experimental XL option for high-VRAM tests
 - `Qwen/Qwen3-Embedding-0.6B`, `Qwen/Qwen3-Embedding-4B`, `Qwen/Qwen3-Embedding-8B` long-context (32k) models
 
-Embeddings are normalized by default and no automatic `query:` / `passage:` prefixes are added.
+Embeddings are normalized. Prompts are only added when a request sets `input_type` (see [Query and Document Prompts](#query-and-document-prompts)).
+
+Switching models changes the vector space (and usually the dimension). Re-embed stored vectors after switching; vectors from different models must not be mixed.
 
 ## Quick Start
 
@@ -73,8 +77,9 @@ Optional environment variables:
 
 ```json
 {
-  "model": "intfloat/multilingual-e5-small",
-  "inputs": ["hello world", "another text"]
+  "model": "google/embeddinggemma-2",
+  "inputs": ["hello world", "another text"],
+  "input_type": "document"
 }
 ```
 
@@ -93,25 +98,41 @@ Response includes `model_id`, `dimension`, `vectors`, backend/device metadata, b
 
 ## Token Window, GPU Batch Size and Quantization
 
-- `max_seq_length` ("Max Tokens / Text"): truncation limit per text. `0` uses the model default (Qwen3: 4096, others: their native limit). Values above a model's native limit are clamped, so E5 always stays at 512 tokens.
-- `encode_batch_size` ("GPU Batch Size"): texts per forward pass. `0` uses the model default (Qwen3: 2, others: `batch_max_texts`). `batch_max_texts` / `batch_max_chars` only control how queued requests are merged.
-- `quantization`: `none`, `int8` or `nf4` via bitsandbytes, PyTorch CUDA only. Ignored on CPU/OpenVINO.
+- `max_seq_length` ("Max Tokens / Text"): truncation limit per text. `0` uses the model default (EmbeddingGemma 2 and Qwen3: 4096, others: their native limit). Values above a model's limit are clamped (E5: 512, EmbeddingGemma 2: 8192).
+- `encode_batch_size` ("GPU Batch Size"): texts per forward pass. `0` uses the model default (EmbeddingGemma 2: 4, Qwen3: 2, others: `batch_max_texts`). `batch_max_texts` / `batch_max_chars` only control how queued requests are merged.
+- `quantization`: `none`, `int8` or `nf4` via bitsandbytes. Applied only to Qwen3 models on PyTorch CUDA; ignored for other models.
 
-Measured on an RTX 4090 (peak PyTorch allocation; add ~0.5 GB CUDA context):
+Measured on an RTX 4090 (peak PyTorch allocation; add ~0.5 GB CUDA context). Retrieval quality is nDCG@10 on GermanQuAD (short Wikipedia passages) and a 1000-document GerDaLIR subset (German court decisions, ~3300 tokens), with query/document prompts:
 
-| Model | Variant | 512 tok, batch 48 | 4096 tok, batch 1 | 4096 tok, batch 4 |
+| Model | VRAM 4096 tok, batch 1 | Tokens/s 4096 tok | GermanQuAD | GerDaLIR |
 |---|---|---|---|---|
-| E5 Large | BF16 | 1.6 GB | n/a (512 max) | n/a |
-| Qwen3 0.6B | BF16 | | 1.7 GB | 3.3 GB |
-| Qwen3 4B | NF4 | | 3.4 GB | 6.0 GB |
-| Qwen3 4B | BF16 | | 8.4 GB | 11.0 GB |
-| Qwen3 8B | NF4 | | 5.5 GB | 8.4 GB |
-| Qwen3 8B | INT8 | | 8.9 GB | 12.3 GB |
-| Qwen3 8B | BF16 | | 15.1 GB | 18.0 GB |
+| E5 Large (512 tok max) | 1.1 GB | 157k (512 tok, batch 48) | 94.6 | 34.1 |
+| EmbeddingGemma 2 | 1.9 GB | 60k (batch 4) | 95.6 | 62.2 |
+| Qwen3 0.6B | 1.7 GB | 44k | 94.2 | 59.9 |
+| Qwen3 4B NF4 | 3.4 GB | 11k | 96.2 | 66.7 |
+| Qwen3 4B BF16 | 8.4 GB | 12k | 96.5 | 68.0 |
+| Qwen3 8B NF4 | 5.5 GB | 7k | 97.3 | 67.8 |
+| Qwen3 8B BF16 | 15.1 GB | 7.7k | 97.4 | 67.9 |
 
-At 4096 tokens the GPU is saturated at batch 1-2; larger GPU batches only add VRAM. Embedding cosine vs. BF16: INT8 ~0.998, NF4 ~0.977.
+At 4096 tokens Qwen3 is saturated at batch 1-2 and EmbeddingGemma 2 at batch 4; larger GPU batches only add VRAM. Embedding cosine vs. BF16: INT8 ~0.998, NF4 ~0.97-0.98.
 
-Qwen3 models use last-token pooling and expect an instruction prefix on queries (`Instruct: <task>\nQuery:<text>`); documents are embedded raw. G3_EMBED does not add prefixes automatically.
+## Query and Document Prompts
+
+`POST /embed` and `POST /v1/embeddings` accept an optional `input_type`:
+
+- `"query"`: search queries
+- `"document"`: stored passages/documents
+
+The server then prepends the model's prompt. Aliases `passage`, `search_query` and `search_document` are accepted. Without `input_type` (or with any other value), texts are embedded unchanged (previous behavior).
+
+| Model | `query` | `document` |
+|---|---|---|
+| EmbeddingGemma 2 | `task: search result \| query: ` | `title: none \| text: ` |
+| E5 small/base/large | `query: ` | `passage: ` |
+| Qwen3 | `Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:` | none |
+| BGE, MiniLM | none | none |
+
+Use the same `input_type` convention for indexing and searching, and re-embed stored documents if you start using prompts.
 
 ## Notes
 
@@ -119,4 +140,17 @@ On CUDA the runtime disables the `enable_gqa` SDPA path in transformers. Otherwi
 
 `LostGentoo/Qwen3-Embedding-8B-AWQ` (compressed-tensors) is not included: with transformers 4.x it is decompressed to BF16 at runtime (~18 GB VRAM) and diverged noticeably from the BF16 reference. Use `Qwen/Qwen3-Embedding-8B` with `nf4` or `int8` instead.
 
-`torch.compile` is exposed as an optional setting and defaults to `off`. Triton for Windows is not installed by default; OpenVINO is the first-class Intel acceleration path for this app.
+`torch.compile` is exposed as an optional setting and defaults to `off`. It is skipped automatically when Triton is not installed (the default on Windows) and for bitsandbytes-quantized models.
+
+## OpenVINO
+
+EmbeddingGemma 2 requires transformers 5.18+. `optimum-intel`, which sentence-transformers needs for `backend="openvino"`, currently supports only transformers < 5.6, so it is not installed. Without it, `backend_override=openvino` and the Intel NPU/iGPU targets fall back to PyTorch (CUDA, XPU or CPU). `/health` reports `openvino_backend_available`.
+
+## Switching Between Versions
+
+Two git tags mark the dependency stacks:
+
+- `openvino-transformers4`: transformers 4.57, OpenVINO backend, E5 and Qwen3 (no EmbeddingGemma 2)
+- `gemma2-transformers5`: transformers 5.19, EmbeddingGemma 2 default, no OpenVINO backend
+
+After `git checkout <tag>`, reinstall the matching dependencies (`start.bat` does this automatically when `requirements.txt` changed; otherwise run `install.bat` / `bash ./install.sh`). Saved settings that point to a model the checked-out version does not know fall back to that version's default model.

@@ -10,7 +10,7 @@ from typing import Iterable
 
 TORCH_VARIANT_ENV = "GENESIS_TORCH_VARIANT"
 DEFAULT_TORCH_VARIANT = "auto"
-TORCH_PACKAGES = ["torch", "torchaudio"]
+TORCH_PACKAGES = ["torch", "torchvision", "torchaudio"]
 PYTORCH_INDEX_BY_VARIANT = {
     "cpu": "https://download.pytorch.org/whl/cpu",
     "cuda": "https://download.pytorch.org/whl/cu128",
@@ -132,6 +132,35 @@ def build_install_command(python_executable: str, variant: str) -> list[str]:
     ]
 
 
+def build_missing_packages_command(python_executable: str, variant: str) -> list[str] | None:
+    """Install only missing torch packages, pinned to the installed torch so it is not replaced."""
+    import importlib.metadata
+
+    missing: list[str] = []
+    torch_version: str | None = None
+    for package in TORCH_PACKAGES:
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            missing.append(package)
+            continue
+        if package == "torch":
+            torch_version = version
+    if not missing:
+        return None
+    index_url = PYTORCH_INDEX_BY_VARIANT[variant]
+    pinned: list[str] = []
+    if torch_version and "torch" not in missing:
+        pinned = [f"torch=={torch_version}"]
+        # Use the index of the installed build (e.g. +cu128), which may differ from the variant detected now.
+        local_tag = torch_version.split("+", 1)[1] if "+" in torch_version else ""
+        if local_tag.startswith("cu"):
+            index_url = f"https://download.pytorch.org/whl/{local_tag}"
+        elif local_tag in PYTORCH_INDEX_BY_VARIANT:
+            index_url = PYTORCH_INDEX_BY_VARIANT[local_tag]
+    return [python_executable, "-m", "pip", "install", *pinned, *missing, "--index-url", index_url]
+
+
 def print_command(parts: Iterable[str]) -> str:
     return " ".join(f'"{part}"' if " " in part else part for part in parts)
 
@@ -156,6 +185,11 @@ def main() -> int:
         action="store_true",
         help="Print the chosen backend and pip command without installing anything",
     )
+    parser.add_argument(
+        "--only-missing",
+        action="store_true",
+        help="Only install torch packages that are missing, keeping the installed torch version",
+    )
     args = parser.parse_args()
 
     try:
@@ -165,7 +199,14 @@ def main() -> int:
         return 2
 
     resolved_variant, reason = resolve_torch_variant(requested_variant)
-    command = build_install_command(args.python_executable, resolved_variant)
+    if args.only_missing:
+        missing_command = build_missing_packages_command(args.python_executable, resolved_variant)
+        if missing_command is None:
+            print("[Torch Install] All torch packages present.", flush=True)
+            return 0
+        command = missing_command
+    else:
+        command = build_install_command(args.python_executable, resolved_variant)
 
     print(
         f"[Torch Install] Requested variant: {requested_variant} | resolved: {resolved_variant} | reason: {reason}",

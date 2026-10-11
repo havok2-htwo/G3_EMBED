@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 from .genesis_embed_server_globals import (
     BACKEND_OPTIONS,
+    DEFAULT_MODEL_ID,
     COMPILE_OPTIONS,
     EXECUTION_TARGET_OPTIONS,
     LOG_FILE,
@@ -18,7 +19,7 @@ from .genesis_embed_server_globals import (
 )
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "default_model": "intfloat/multilingual-e5-small",
+    "default_model": DEFAULT_MODEL_ID,
     "execution_target": "auto",
     "backend_override": "auto",
     "model_cache_path": ".\\models",

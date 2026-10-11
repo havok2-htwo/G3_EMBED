@@ -26,11 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# CPU-only torch first (sentence-transformers dependency). Pulling it from the CPU
+# CPU-only torch + torchvision first (sentence-transformers / EmbeddingGemma 2 processor). Pulling it from the CPU
 # index avoids the multi-GB CUDA build that PyPI's default torch wheel would drag in.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
-    pip install torch --index-url https://download.pytorch.org/whl/cpu
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \

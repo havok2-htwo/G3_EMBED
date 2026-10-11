@@ -9,7 +9,6 @@ if [[ ! -f "$SETTINGS_FILE" ]]; then
   mkdir -p /app/logs
   cat > "$SETTINGS_FILE" <<'JSON'
 {
-  "default_model": "intfloat/multilingual-e5-small",
   "execution_target": "auto",
   "backend_override": "auto",
   "model_cache_path": "/app/models",

@@ -22,19 +22,22 @@ Request:
 
 ```json
 {
-  "model": "intfloat/multilingual-e5-small",
-  "inputs": ["Text A", "Text B"]
+  "model": "google/embeddinggemma-2",
+  "inputs": ["Text A", "Text B"],
+  "input_type": "document"
 }
 ```
 
-`inputs` may also be a single string.
+`inputs` may also be a single string. `model` defaults to the configured default model (`google/embeddinggemma-2`).
+
+`input_type` is optional: `"query"` or `"document"` prepends the model's query/document prompt (for example `query: ` / `passage: ` for E5, `task: search result | query: ` / `title: none | text: ` for EmbeddingGemma 2). Aliases `passage`, `search_query` and `search_document` are accepted. Omit it, or send any other value, to embed the raw text.
 
 Response:
 
 ```json
 {
-  "model_id": "intfloat/multilingual-e5-small",
-  "dimension": 384,
+  "model_id": "google/embeddinggemma-2",
+  "dimension": 768,
   "vectors": [[0.1, 0.2]],
   "backend": "pytorch",
   "device": "cuda",
@@ -61,10 +64,13 @@ Request:
 
 ```json
 {
-  "model": "intfloat/multilingual-e5-small",
-  "input": ["Text A", "Text B"]
+  "model": "google/embeddinggemma-2",
+  "input": ["Text A", "Text B"],
+  "input_type": "query"
 }
 ```
+
+`input_type` works as for `POST /embed` (non-standard extension; OpenAI clients can send it as an extra body field).
 
 Response uses OpenAI's `object`, `data`, `model`, and `usage` shape. Embeddings are returned as float arrays.
 

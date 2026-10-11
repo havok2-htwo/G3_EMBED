@@ -10,7 +10,14 @@ from typing import Any, List
 
 import numpy as np
 
-from .genesis_embed_server_globals import current_settings, get_model_spec, resolve_model_cache_path, settings_lock
+from .genesis_embed_server_globals import (
+    DEFAULT_MODEL_ID,
+    MAX_SEQ_LENGTH_LIMIT,
+    current_settings,
+    get_model_spec,
+    resolve_model_cache_path,
+    settings_lock,
+)
 from .genesis_embed_server_hardware import RuntimeChoice, get_system_snapshot, resolve_runtime_choice
 
 
@@ -95,12 +102,16 @@ def _model_kwargs_for_precision(
     quantization: str = "none",
     preferred_dtype: str | None = None,
 ) -> dict[str, Any]:
-    if choice.backend != "pytorch" or choice.device == "cpu":
+    if choice.backend != "pytorch":
         return {}
     try:
         import torch
     except Exception:
         return {}
+
+    if choice.device == "cpu":
+        # transformers 5 defaults to the checkpoint dtype (bf16 for Gemma/Qwen3), which is slow on most CPUs.
+        return {"dtype": torch.bfloat16 if precision == "bfloat16" else torch.float32}
 
     selected = precision
     if selected == "auto":
@@ -116,7 +127,7 @@ def _model_kwargs_for_precision(
         "float32": torch.float32,
     }
     torch_dtype = dtype_by_name.get(selected)
-    kwargs: dict[str, Any] = {"torch_dtype": torch_dtype} if torch_dtype is not None else {}
+    kwargs: dict[str, Any] = {"dtype": torch_dtype} if torch_dtype is not None else {}
 
     if quantization in {"int8", "nf4"}:
         try:
@@ -146,11 +157,19 @@ def _maybe_compile_sentence_transformer(model: Any, compile_mode: str, choice: R
 
         if not hasattr(torch, "compile"):
             return model
-        first_module = model._first_module()
-        auto_model = getattr(first_module, "auto_model", None)
-        if auto_model is None:
+        import importlib.util
+
+        # Inductor needs Triton on CUDA/XPU (not installed by default on Windows); compile would fail on first encode.
+        if importlib.util.find_spec("triton") is None:
+            print("[G3_EMBED] torch.compile skipped: Triton is not installed", flush=True)
             return model
-        first_module.auto_model = torch.compile(auto_model, mode=compile_mode)
+        first_module = model._first_module()
+        # sentence-transformers 6 exposes auto_model read-only; the module itself lives in .model.
+        attribute = "model" if isinstance(getattr(first_module, "model", None), torch.nn.Module) else "auto_model"
+        inner_model = getattr(first_module, attribute, None)
+        if inner_model is None:
+            return model
+        setattr(first_module, attribute, torch.compile(inner_model, mode=compile_mode))
     except Exception as exc:
         print(f"[G3_EMBED] torch.compile skipped: {exc}", flush=True)
     return model
@@ -191,7 +210,9 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
                 kwargs["model_kwargs"] = model_kwargs
 
         model = SentenceTransformer(runtime_key.model_id, **kwargs)
-        native_max_seq_length = int(getattr(model, "max_seq_length", 0) or 0)
+        # Some tokenizers report a placeholder limit (EmbeddingGemma 2: 1e30); cap it at the spec or global limit.
+        spec_limit = int(get_model_spec(runtime_key.model_id).get("max_seq_length") or MAX_SEQ_LENGTH_LIMIT)
+        native_max_seq_length = min(int(getattr(model, "max_seq_length", 0) or 0) or spec_limit, spec_limit)
         model = _maybe_compile_sentence_transformer(model, runtime_key.compile_mode, choice, runtime_key.quantization)
         if _is_cuda_pytorch(choice):
             # Quantized loading stages full-precision shards on the GPU; release that cache.
@@ -266,11 +287,11 @@ def build_runtime_key(model_id: str, settings: dict[str, Any] | None = None) -> 
 
     normalized_model_id = (model_id or settings_snapshot.get("default_model") or "").strip()
     if not normalized_model_id:
-        normalized_model_id = "intfloat/multilingual-e5-small"
+        normalized_model_id = DEFAULT_MODEL_ID
 
     choice = resolve_runtime_choice(settings_snapshot)
     quantization = str(settings_snapshot.get("quantization") or "none")
-    if not _is_cuda_pytorch(choice):
+    if not _is_cuda_pytorch(choice) or not get_model_spec(normalized_model_id).get("quantizable"):
         quantization = "none"
     return (
         RuntimeKey(

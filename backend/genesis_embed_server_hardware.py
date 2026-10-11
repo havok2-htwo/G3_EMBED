@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 import platform
 import shutil
@@ -104,6 +105,20 @@ def detect_openvino_devices() -> list[str]:
         return []
 
 
+@functools.lru_cache(maxsize=1)
+def openvino_backend_available() -> bool:
+    """sentence-transformers needs optimum-intel for backend="openvino"; it does not support transformers 5 yet.
+
+    Import it for real: a venv upgraded from the transformers-4 stack can still contain an
+    optimum-intel that is present on disk but fails to import against transformers 5.
+    """
+    try:
+        from optimum.intel.openvino import OVModelForFeatureExtraction  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def detect_torch_devices() -> dict[str, Any]:
     info: dict[str, Any] = {
         "torch_available": False,
@@ -169,6 +184,7 @@ def get_system_snapshot() -> dict[str, Any]:
         "windows_video_devices": windows_video,
         "windows_npu_devices": npu_probe,
         "openvino_devices": openvino_devices,
+        "openvino_backend_available": openvino_backend_available(),
         "torch": torch_info,
         "detected_accelerator_hardware": accelerator_hardware,
     }
@@ -181,7 +197,9 @@ def resolve_runtime_choice(settings: dict[str, Any]) -> RuntimeChoice:
     backend_override = str(settings.get("backend_override") or "auto").strip()
     snapshot = get_system_snapshot()
     torch_info = snapshot["torch"]
-    openvino_devices = set(snapshot["openvino_devices"])
+    openvino_available = bool(snapshot.get("openvino_backend_available"))
+    # Without optimum-intel, OpenVINO devices cannot run models; route Intel targets to PyTorch instead.
+    openvino_devices = set(snapshot["openvino_devices"]) if openvino_available else set()
 
     def choice(backend: str, device: str, label: str, source: str, detail: str) -> RuntimeChoice:
         return RuntimeChoice(backend=backend, device=device, device_label=label, source=source, detail=detail)
@@ -193,6 +211,8 @@ def resolve_runtime_choice(settings: dict[str, Any]) -> RuntimeChoice:
             return choice("pytorch", "xpu", (torch_info.get("xpu_devices") or ["Intel XPU"])[0], "settings", "PyTorch XPU")
         return choice("pytorch", "cpu", "CPU", "settings", "PyTorch CPU")
 
+    if backend_override == "openvino" and not openvino_available:
+        backend_override = "auto"
     if backend_override == "openvino":
         if target in {"auto", "intel_npu"} and "NPU" in openvino_devices:
             return choice("openvino", "NPU", "Intel NPU", "settings", "OpenVINO NPU")

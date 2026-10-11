@@ -8,7 +8,15 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .genesis_embed_server_auth import authorize_api_key, get_auth_store
-from .genesis_embed_server_globals import MODEL_OPTIONS, batch_history, current_settings, embedding_history, history_lock, settings_lock
+from .genesis_embed_server_globals import (
+    MODEL_OPTIONS,
+    batch_history,
+    current_settings,
+    embedding_history,
+    get_model_spec,
+    history_lock,
+    settings_lock,
+)
 from .genesis_embed_server_runtime import EncodeResult, encode_texts, get_runtime_status
 from .genesis_embed_server_storage import log_embedding
 
@@ -16,6 +24,13 @@ from .genesis_embed_server_storage import log_embedding
 class EmbedRequest(BaseModel):
     model: str | None = Field(default=None, description="SentenceTransformer model id")
     inputs: Union[str, List[str]]
+    input_type: str | None = Field(
+        default=None,
+        description=(
+            "'query' or 'document' prepends the model's query/document prompt (e.g. 'query: ' for E5). "
+            "Aliases: passage, search_query, search_document. Omit or use any other value to embed the raw text."
+        ),
+    )
 
 
 class EmbedResponse(BaseModel):
@@ -39,6 +54,13 @@ class OpenAIEmbeddingRequest(BaseModel):
     model: str | None = None
     encoding_format: str | None = None
     user: str | None = None
+    input_type: str | None = Field(
+        default=None,
+        description=(
+            "'query' or 'document' prepends the model's query/document prompt (e.g. 'query: ' for E5). "
+            "Aliases: passage, search_query, search_document. Omit or use any other value to embed the raw text."
+        ),
+    )
 
 
 def _now_iso() -> str:
@@ -48,6 +70,24 @@ def _now_iso() -> str:
 def _normalize_inputs(inputs: Union[str, List[str]]) -> list[str]:
     normalized = inputs if isinstance(inputs, list) else [inputs]
     return [str(item or "") for item in normalized]
+
+
+# Common client conventions (NVIDIA NIM: passage, Cohere/LiteLLM: search_query/search_document).
+_INPUT_TYPE_ALIASES = {
+    "query": "query",
+    "search_query": "query",
+    "document": "document",
+    "passage": "document",
+    "search_document": "document",
+}
+
+
+def _apply_input_prompt(model_id: str, inputs: list[str], input_type: str | None) -> list[str]:
+    kind = _INPUT_TYPE_ALIASES.get(str(input_type or "").strip().lower())
+    if not kind:
+        return inputs
+    prompt = str(get_model_spec(model_id).get(f"{kind}_prompt") or "")
+    return [prompt + text for text in inputs] if prompt else inputs
 
 
 def _result_to_response(result: EncodeResult, *, batched: bool) -> dict[str, Any]:
@@ -81,6 +121,7 @@ async def embed_texts_for_request(
     inputs: list[str],
     route: str,
     force_direct: bool = False,
+    input_type: str | None = None,
 ) -> tuple[EncodeResult, bool]:
     if not inputs:
         raise HTTPException(status_code=400, detail="inputs must not be empty")
@@ -90,6 +131,7 @@ async def embed_texts_for_request(
     effective_model = (model_id or settings_snapshot.get("default_model") or "").strip()
     if not effective_model:
         raise HTTPException(status_code=400, detail="model is required")
+    inputs = _apply_input_prompt(effective_model, inputs, input_type)
 
     source_ip = request.client.host if request.client else "unknown"
     batched = bool(settings_snapshot.get("batching_enabled")) and not force_direct
@@ -164,6 +206,7 @@ def create_api(app: FastAPI) -> FastAPI:
             model_id=payload.model,
             inputs=_normalize_inputs(payload.inputs),
             route="/embed",
+            input_type=payload.input_type,
         )
         if api_key_id:
             get_auth_store().record_api_key_usage(api_key_id, result.input_count)
@@ -192,6 +235,7 @@ def create_api(app: FastAPI) -> FastAPI:
             model_id=payload.model,
             inputs=_normalize_inputs(payload.input),
             route="/v1/embeddings",
+            input_type=payload.input_type,
         )
         if api_key_id:
             get_auth_store().record_api_key_usage(api_key_id, result.input_count)

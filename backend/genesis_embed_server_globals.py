@@ -14,7 +14,25 @@ LOG_FILE = LOGS_DIR / "embedding_log.jsonl"
 HISTORY_MAX_LEN = 200
 BATCH_HISTORY_MAX_LEN = 100
 
+DEFAULT_MODEL_ID = "google/embeddinggemma-2"
+QWEN3_QUERY_PROMPT = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+
 MODEL_SPECS: Dict[str, Dict[str, Any]] = {
+    "google/embeddinggemma-2": {
+        "label": "EmbeddingGemma 2",
+        "family": "Gemma",
+        "tier": "stable",
+        "approx_size_gb": 1.5,
+        "dimensions": 768,
+        "recommended_backend": "cuda",
+        "preferred_dtype": "bfloat16",
+        "max_seq_length": 8192,
+        "default_max_seq_length": 4096,
+        "default_encode_batch_size": 4,
+        "query_prompt": "task: search result | query: ",
+        "document_prompt": "title: none | text: ",
+        "notes": "Default. Multilingual, 8k context, 768 dims. ~1.9 GB VRAM at 4096 tokens, batch 1; ~3.3 GB at batch 4.",
+    },
     "intfloat/multilingual-e5-small": {
         "label": "E5 Multilingual Small",
         "family": "E5",
@@ -22,7 +40,9 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 0.47,
         "dimensions": 384,
         "recommended_backend": "auto",
-        "notes": "Fast default multilingual embedding model.",
+        "query_prompt": "query: ",
+        "document_prompt": "passage: ",
+        "notes": "Fast multilingual embedding model.",
     },
     "intfloat/multilingual-e5-base": {
         "label": "E5 Multilingual Base",
@@ -31,6 +51,8 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 1.1,
         "dimensions": 768,
         "recommended_backend": "auto",
+        "query_prompt": "query: ",
+        "document_prompt": "passage: ",
         "notes": "Balanced multilingual quality and latency.",
     },
     "intfloat/multilingual-e5-large": {
@@ -40,6 +62,8 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 2.2,
         "dimensions": 1024,
         "recommended_backend": "cuda",
+        "query_prompt": "query: ",
+        "document_prompt": "passage: ",
         "notes": "Higher quality multilingual baseline.",
     },
     "BAAI/bge-m3": {
@@ -77,6 +101,8 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "dimensions": 1024,
         "recommended_backend": "cuda",
         "preferred_dtype": "bfloat16",
+        "quantizable": True,
+        "query_prompt": QWEN3_QUERY_PROMPT,
         "default_max_seq_length": 4096,
         "default_encode_batch_size": 2,
         "notes": "Long-context (32k) multilingual model with E5-Large dimensions. ~1.7 GB VRAM at 4096 tokens, batch 1.",
@@ -89,6 +115,8 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "dimensions": 2560,
         "recommended_backend": "cuda",
         "preferred_dtype": "bfloat16",
+        "quantizable": True,
+        "query_prompt": QWEN3_QUERY_PROMPT,
         "default_max_seq_length": 4096,
         "default_encode_batch_size": 2,
         "notes": "VRAM at 4096 tokens, batch 1: ~8.7 GB BF16, ~3.8 GB NF4.",
@@ -101,6 +129,8 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "dimensions": 4096,
         "recommended_backend": "cuda",
         "preferred_dtype": "bfloat16",
+        "quantizable": True,
+        "query_prompt": QWEN3_QUERY_PROMPT,
         "default_max_seq_length": 4096,
         "default_encode_batch_size": 2,
         "notes": "VRAM at 4096 tokens, batch 1: ~15.4 GB BF16, ~9 GB INT8, ~5.5-7 GB NF4.",
