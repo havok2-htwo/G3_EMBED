@@ -342,6 +342,25 @@ def _effective_max_seq_length(model_id: str, settings: dict[str, Any], native_ma
     return configured
 
 
+def reported_max_seq_length(model_id: str) -> int | None:
+    """The token window /embed applies to `model_id` (reported as max_model_len on /v1/models).
+
+    A loaded model uses its native limit; an unloaded one the catalog limit, or None when the
+    catalog does not know it (the native limit is only known after loading).
+    """
+    with settings_lock:
+        settings_snapshot = dict(current_settings)
+    native = 0
+    for key, value in list(_model_cache.items()):
+        if key.model_id == model_id:
+            native = max(native, int(value.get("native_max_seq_length") or 0))
+    if native <= 0:
+        native = int(get_model_spec(model_id).get("max_seq_length") or 0)
+        if native <= 0:
+            return None
+    return _effective_max_seq_length(model_id, settings_snapshot, native)
+
+
 def _effective_encode_batch_size(model_id: str, settings: dict[str, Any], text_count: int) -> int:
     configured = int(settings.get("encode_batch_size") or 0)
     if configured <= 0:
