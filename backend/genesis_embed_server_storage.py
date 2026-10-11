@@ -12,6 +12,8 @@ from .genesis_embed_server_globals import (
     LOG_FILE,
     LOGS_DIR,
     MAX_SEQ_LENGTH_LIMIT,
+    MEDIA_LIMIT_SETTINGS,
+    MEDIA_TOGGLE_SETTINGS,
     MODEL_SPECS,
     PRECISION_OPTIONS,
     QUANTIZATION_OPTIONS,
@@ -36,6 +38,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "compile_mode": "off",
     "warmup_on_load": False,
     "huggingface_token": "",
+    **MEDIA_TOGGLE_SETTINGS,
+    **{name: default for name, (default, _, _) in MEDIA_LIMIT_SETTINGS.items()},
 }
 
 
@@ -101,6 +105,11 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "compile_mode": _valid_option(COMPILE_OPTIONS, source.get("compile_mode"), "off"),
         "warmup_on_load": bool(source.get("warmup_on_load", DEFAULT_SETTINGS["warmup_on_load"])),
         "huggingface_token": str(source.get("huggingface_token", "")).strip(),
+        **{name: bool(source.get(name, default)) for name, default in MEDIA_TOGGLE_SETTINGS.items()},
+        **{
+            name: _clamp_int(source.get(name, default), minimum=minimum, maximum=maximum, default=default)
+            for name, (default, minimum, maximum) in MEDIA_LIMIT_SETTINGS.items()
+        },
     }
 
 

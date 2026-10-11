@@ -9,10 +9,11 @@ from typing import Union
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse
 
 from .genesis_embed_server_admin import create_admin_api
-from .genesis_embed_server_api import create_api
+from .genesis_embed_server_api import RequestBodyLimitMiddleware, create_api, request_validation_exception_handler
 from .genesis_embed_server_batching import EmbedBatchManager
 from .genesis_embed_server_globals import current_settings
 from .genesis_embed_server_model_manager import list_model_statuses
@@ -83,6 +84,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="G3_EMBED API", version="1.0.0", lifespan=lifespan)
+# 413 for oversized /embed and /v1/embeddings bodies before FastAPI buffers and parses them.
+app.add_middleware(RequestBodyLimitMiddleware)
+app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 app = create_api(app)
 app = create_admin_api(app)
 

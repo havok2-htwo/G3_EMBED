@@ -8,6 +8,7 @@ import {
   CompareResponse,
   CreatedApiKey,
   ManagedModel,
+  MediaCounts,
   QueueResponse,
   RuntimeInfo,
   SettingsResponse,
@@ -40,6 +41,8 @@ type HistoryEntry = {
   device?: string;
   input_count?: number;
   input_chars?: number;
+  input_tokens?: number | null;
+  media?: MediaCounts | null;
   total_duration_ms?: number;
   encode_duration_ms?: number;
   texts_per_second?: number;
@@ -77,7 +80,58 @@ const emptySettings: AdminSettings = {
   compile_mode: "off",
   warmup_on_load: false,
   huggingface_token: "",
+  image_inputs_enabled: true,
+  audio_inputs_enabled: true,
+  video_inputs_enabled: true,
+  max_images_per_input: 4,
+  max_images_per_request: 16,
+  max_audio_clips_per_input: 2,
+  max_audio_seconds_per_clip: 30,
+  max_audio_seconds_per_request: 120,
+  max_videos_per_request: 1,
+  max_video_frames: 8,
+  max_media_item_mb: 8,
+  max_image_megapixels: 25,
+  max_request_mb: 32,
+  media_pass_budget_mb: 1200,
+  max_concurrent_media_requests: 2,
 };
+
+type MediaLimitKey =
+  | "max_images_per_input"
+  | "max_images_per_request"
+  | "max_image_megapixels"
+  | "max_audio_clips_per_input"
+  | "max_audio_seconds_per_clip"
+  | "max_audio_seconds_per_request"
+  | "max_videos_per_request"
+  | "max_video_frames"
+  | "max_media_item_mb"
+  | "max_request_mb"
+  | "media_pass_budget_mb"
+  | "max_concurrent_media_requests";
+
+// min/max mirror MEDIA_LIMIT_SETTINGS in the backend (normalize_settings clamps to the same range).
+const mediaLimitFields: Array<{ key: MediaLimitKey; label: string; min: number; max: number; step?: number }> = [
+  { key: "max_images_per_input", label: "Images / Input", min: 1, max: 8 },
+  { key: "max_images_per_request", label: "Images / Request", min: 1, max: 32 },
+  { key: "max_image_megapixels", label: "Image Size (MP)", min: 1, max: 50 },
+  { key: "max_audio_clips_per_input", label: "Audio Clips / Input", min: 1, max: 4 },
+  { key: "max_audio_seconds_per_clip", label: "Audio / Clip (s)", min: 1, max: 30 },
+  { key: "max_audio_seconds_per_request", label: "Audio / Request (s)", min: 1, max: 300 },
+  { key: "max_videos_per_request", label: "Videos / Request", min: 1, max: 2 },
+  { key: "max_video_frames", label: "Frames / Video", min: 1, max: 16 },
+  { key: "max_media_item_mb", label: "Media Item (MB)", min: 1, max: 25 },
+  { key: "max_request_mb", label: "Request Body (MB)", min: 1, max: 256 },
+  { key: "media_pass_budget_mb", label: "VRAM Budget / Pass (MB)", min: 200, max: 4096, step: 100 },
+  { key: "max_concurrent_media_requests", label: "Concurrent Media Requests", min: 1, max: 8 },
+];
+
+const mediaToggleFields: Array<{ key: "image_inputs_enabled" | "audio_inputs_enabled" | "video_inputs_enabled"; label: string }> = [
+  { key: "image_inputs_enabled", label: "Allow images" },
+  { key: "audio_inputs_enabled", label: "Allow audio" },
+  { key: "video_inputs_enabled", label: "Allow video (frames)" },
+];
 
 const emptyOptions = {
   models: [] as AdminOption[],
@@ -137,6 +191,15 @@ function formatModelStatus(status: string) {
   if (status === "partial") return "Partial";
   if (status === "error") return "Error";
   return "Missing";
+}
+
+// History never holds payloads, only counts; audio seconds are unknown when decoding failed.
+function formatMediaCounts(media: MediaCounts) {
+  const parts: string[] = [];
+  if (media.images) parts.push(`${formatValue(media.images)} img`);
+  if (media.audio_seconds) parts.push(`${formatValue(media.audio_seconds, " s")} audio`);
+  if (media.video_frames) parts.push(`${formatValue(media.video_frames)} frames`);
+  return parts.length > 0 ? parts.join(" · ") : "media";
 }
 
 function resolveOptionLabel(options: AdminOption[], value: string | null | undefined, fallback = "n/a") {
@@ -270,8 +333,9 @@ export default function App() {
   const history = (stats?.history ?? []) as HistoryEntry[];
 
   function applySettings(payload: SettingsResponse) {
-    setSettingsForm(payload.settings);
-    setSettingsOptions(payload.options);
+    // Merge with defaults so an older backend without newer fields cannot crash the render.
+    setSettingsForm({ ...emptySettings, ...payload.settings });
+    setSettingsOptions({ ...emptyOptions, ...payload.options });
     setManagedModels(payload.models ?? []);
     setRuntime(payload.runtime);
     setCompareModel((current) => current || payload.settings.default_model);
@@ -922,6 +986,21 @@ export default function App() {
               <input type="checkbox" checked={settingsForm.warmup_on_load} onChange={(event) => updateSetting("warmup_on_load", event.target.checked)} />
               <span>Warm up on load</span>
             </label>
+            <span className="eyebrow full-width">Media limits (image / audio / video)</span>
+            <div className="button-row full-width">
+              {mediaToggleFields.map((field) => (
+                <label key={field.key} className="switch-row">
+                  <input type="checkbox" checked={settingsForm[field.key]} onChange={(event) => updateSetting(field.key, event.target.checked)} />
+                  <span>{field.label}</span>
+                </label>
+              ))}
+            </div>
+            {mediaLimitFields.map((field) => (
+              <label key={field.key}>
+                <span>{field.label}</span>
+                <input type="number" min={field.min} max={field.max} step={field.step ?? 1} value={settingsForm[field.key]} onChange={(event) => updateSetting(field.key, Number(event.target.value))} />
+              </label>
+            ))}
             <div className="form-actions full-width">
               <button type="submit" disabled={saveBusy}>{saveBusy ? "Saving..." : "Save Settings"}</button>
             </div>
@@ -1053,7 +1132,11 @@ export default function App() {
                     <td>{formatDateTime(entry.timestamp)}</td>
                     <td>{entry.route ?? "n/a"}</td>
                     <td className="mono">{entry.model_id ?? "n/a"}</td>
-                    <td>{formatValue(entry.input_count)} / {formatValue(entry.input_chars)} chars</td>
+                    <td>
+                      {formatValue(entry.input_count)} / {formatValue(entry.input_chars)} chars
+                      {entry.input_tokens !== null && entry.input_tokens !== undefined ? ` / ${formatValue(entry.input_tokens)} tokens` : null}
+                      {entry.media ? <div className="muted">{formatMediaCounts(entry.media)}</div> : null}
+                    </td>
                     <td>{formatValue(entry.dimension)}</td>
                     <td>{formatValue(entry.total_duration_ms, " ms")}</td>
                     <td>{formatValue(entry.encode_duration_ms, " ms")}</td>

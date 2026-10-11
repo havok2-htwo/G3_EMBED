@@ -32,6 +32,11 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "query_prompt": "task: search result | query: ",
         "document_prompt": "title: none | text: ",
         "notes": "Default. Multilingual, 8k context, 768 dims. ~1.9 GB VRAM at 4096 tokens, batch 1; ~3.3 GB at batch 4.",
+        # Accepts image, audio and video (frame list) inputs; other models are text-only.
+        "modalities": ["image", "audio", "video"],
+        # Extra VRAM per forward pass, measured bf16 / sdpa / eager on an RTX 4090 (independent of image
+        # resolution). Peak ~= max(tower cost, lm_token x rows x longest tokens) + overhead.
+        "media_cost_mb": {"image": 74, "video_frame": 36, "audio_second": 3.5, "lm_token": 0.125, "overhead": 50},
     },
     "intfloat/multilingual-e5-small": {
         "label": "E5 Multilingual Small",
@@ -167,6 +172,36 @@ QUANTIZATION_OPTIONS = [
 ]
 
 MAX_SEQ_LENGTH_LIMIT = 32768
+
+# Media input settings: name -> (default, minimum, hard maximum). normalize_settings clamps to these ranges.
+MEDIA_LIMIT_SETTINGS: Dict[str, tuple[int, int, int]] = {
+    "max_images_per_input": (4, 1, 8),
+    "max_images_per_request": (16, 1, 32),
+    "max_audio_clips_per_input": (2, 1, 4),
+    # The feature extractor silently cuts audio at 30 s; longer clips are rejected instead.
+    "max_audio_seconds_per_clip": (30, 1, 30),
+    "max_audio_seconds_per_request": (120, 1, 300),
+    "max_videos_per_request": (1, 1, 2),
+    # 16 frames x (140 + 2) tokens + 2 = 2274 tokens, inside the default 4096 window.
+    "max_video_frames": (8, 1, 16),
+    "max_media_item_mb": (8, 1, 25),
+    "max_image_megapixels": (25, 1, 50),
+    "max_request_mb": (32, 1, 256),
+    "media_pass_budget_mb": (1200, 200, 4096),
+    "max_concurrent_media_requests": (2, 1, 8),
+}
+MEDIA_TOGGLE_SETTINGS: Dict[str, bool] = {
+    "image_inputs_enabled": True,
+    "audio_inputs_enabled": True,
+    "video_inputs_enabled": True,
+}
+
+# Request schema caps (HTTP 422). Bodies are validated before auth, and every bad list item costs one or more
+# validation errors, so lists stay short enough that a hostile body cannot fan out into millions of errors.
+MAX_INPUTS_PER_REQUEST = 2048
+MAX_MEDIA_ITEMS_PER_FIELD = 64
+# Body cap (HTTP 413) for every other POST/PUT/PATCH/DELETE route (admin, login); embeddings use max_request_mb.
+OTHER_ROUTES_MAX_BODY_MB = 4
 
 TOO_LONG_POLICY_OPTIONS = [
     {"label": "Reject with HTTP 400", "value": "reject"},

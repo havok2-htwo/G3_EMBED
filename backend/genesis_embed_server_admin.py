@@ -5,7 +5,7 @@ from statistics import mean
 from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .genesis_embed_server_api import embed_texts_for_request
 from .genesis_embed_server_auth import (
@@ -20,6 +20,7 @@ from .genesis_embed_server_globals import (
     BACKEND_OPTIONS,
     COMPILE_OPTIONS,
     EXECUTION_TARGET_OPTIONS,
+    MAX_INPUTS_PER_REQUEST,
     MODEL_OPTIONS,
     PRECISION_OPTIONS,
     QUANTIZATION_OPTIONS,
@@ -53,6 +54,22 @@ class AdminSettingsPayload(BaseModel):
     compile_mode: str
     warmup_on_load: bool
     huggingface_token: str
+    # Optional so older frontends keep working; an omitted field keeps its current value (see PUT below).
+    image_inputs_enabled: bool = True
+    audio_inputs_enabled: bool = True
+    video_inputs_enabled: bool = True
+    max_images_per_input: int = 4
+    max_images_per_request: int = 16
+    max_audio_clips_per_input: int = 2
+    max_audio_seconds_per_clip: int = 30
+    max_audio_seconds_per_request: int = 120
+    max_videos_per_request: int = 1
+    max_video_frames: int = 8
+    max_media_item_mb: int = 8
+    max_image_megapixels: int = 25
+    max_request_mb: int = 32
+    media_pass_budget_mb: int = 1200
+    max_concurrent_media_requests: int = 2
 
 
 class AdminModelActionPayload(BaseModel):
@@ -69,7 +86,7 @@ class ComparePayload(BaseModel):
 
 class BenchmarkPayload(BaseModel):
     model: str | None = None
-    inputs: List[str]
+    inputs: List[str] = Field(max_length=MAX_INPUTS_PER_REQUEST)
     repeat_count: int = 1
 
 
@@ -175,9 +192,11 @@ def create_admin_api(app: FastAPI) -> FastAPI:
 
     @app.put("/api/admin/settings")
     async def admin_update_settings(payload: AdminSettingsPayload, _: dict[str, str] = Depends(require_admin)):
-        payload_data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
-        normalized = normalize_settings(payload_data)
+        # Only the fields the client sent: an omitted optional field keeps its current value, so an older
+        # client cannot re-enable a disabled modality or reset a lowered limit to its default.
+        sent = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") else payload.dict(exclude_unset=True)
         with settings_lock:
+            normalized = normalize_settings({**current_settings, **sent})
             current_settings.clear()
             current_settings.update(save_settings(normalized))
         return {

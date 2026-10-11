@@ -11,3 +11,5 @@ openvino>=2025.0,<2027.0
 accelerate>=1.1.0,<2.0
 bitsandbytes>=0.46.1,<1.0; platform_system != "Darwin"
 pillow>=10.0
+soundfile>=0.12,<1.0
+scipy>=1.10,<2.0

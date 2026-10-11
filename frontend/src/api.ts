@@ -20,6 +20,28 @@ export type AdminSettings = {
   compile_mode: string;
   warmup_on_load: boolean;
   huggingface_token: string;
+  // Media inputs (image / audio / video); the backend clamps every limit to its hard range.
+  image_inputs_enabled: boolean;
+  audio_inputs_enabled: boolean;
+  video_inputs_enabled: boolean;
+  max_images_per_input: number;
+  max_images_per_request: number;
+  max_audio_clips_per_input: number;
+  max_audio_seconds_per_clip: number;
+  max_audio_seconds_per_request: number;
+  max_videos_per_request: number;
+  max_video_frames: number;
+  max_media_item_mb: number;
+  max_image_megapixels: number;
+  max_request_mb: number;
+  media_pass_budget_mb: number;
+  max_concurrent_media_requests: number;
+};
+
+export type MediaCounts = {
+  images: number;
+  audio_seconds: number | null;
+  video_frames: number;
 };
 
 export type ManagedModel = {
