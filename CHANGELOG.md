@@ -19,6 +19,7 @@
 
 - Texts over the token limit are now rejected with HTTP 400 `input_too_long` (listing input index and token count) instead of being truncated silently. Setting `too_long_policy` (`reject` default, `truncate`) and per-request `truncate` override it. Checked before batching, prompts and special tokens included.
 
+- `GET /v1/models` reports each model's token window as `max_model_len` (as vLLM does), so clients such as Genesis size their inputs to it instead of a 512-token fallback.
 - Upgraded to transformers 5.19, sentence-transformers 6.1 and huggingface_hub 1.x; added torchvision and pillow.
 - Added `google/embeddinggemma-2` and made it the default model (768 dims, up to 8192 tokens, default window 4096).
 - Added optional `input_type` (`query` / `document`, aliases `passage`, `search_query`, `search_document`) to `/embed` and `/v1/embeddings` to apply each model's prompts.

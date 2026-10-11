@@ -299,7 +299,7 @@ A 500 on a request with media returns only `"detail": "embedding failed"`, witho
 
 ### `GET /v1/models`
 
-OpenAI-compatible model list.
+OpenAI-compatible model list. Each entry carries `max_model_len` (vLLM's field): the token window `/embed` applies to that model — the native limit of a loaded model, otherwise the catalog limit, capped by the `max_seq_length` setting. Models whose limit is only known after loading leave it out.
 
 ### `POST /v1/embeddings`
 

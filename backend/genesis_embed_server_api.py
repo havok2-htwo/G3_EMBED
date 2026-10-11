@@ -51,6 +51,7 @@ from .genesis_embed_server_runtime import (
     encode_inputs,
     encode_texts,
     get_runtime_status,
+    reported_max_seq_length,
     resolve_backend,
 )
 from .genesis_embed_server_storage import log_embedding
@@ -658,6 +659,8 @@ def create_api(app: FastAPI) -> FastAPI:
                     "object": "model",
                     "created": 0,
                     "owned_by": "g3_embed",
+                    # vLLM's field: clients size their inputs by it.
+                    **({"max_model_len": window} if (window := reported_max_seq_length(option["value"])) else {}),
                 }
                 for option in MODEL_OPTIONS
             ],
