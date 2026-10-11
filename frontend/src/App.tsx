@@ -71,6 +71,7 @@ const emptySettings: AdminSettings = {
   batch_max_chars: 64000,
   encode_batch_size: 0,
   max_seq_length: 0,
+  too_long_policy: "reject",
   precision: "auto",
   quantization: "none",
   compile_mode: "off",
@@ -84,6 +85,7 @@ const emptyOptions = {
   backends: [] as AdminOption[],
   precisions: [] as AdminOption[],
   quantizations: [] as AdminOption[],
+  too_long_policies: [] as AdminOption[],
   compile_modes: [] as AdminOption[],
 };
 
@@ -895,6 +897,14 @@ export default function App() {
             <label>
               <span>Max Tokens / Text (0 = model default)</span>
               <input type="number" min={0} step={256} value={settingsForm.max_seq_length} onChange={(event) => updateSetting("max_seq_length", Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Texts Over Token Limit</span>
+              <select value={settingsForm.too_long_policy} onChange={(event) => updateSetting("too_long_policy", event.target.value)}>
+                {settingsOptions.too_long_policies.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
             </label>
             <label className="full-width">
               <span>Cache Path</span>

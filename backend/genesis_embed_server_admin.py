@@ -23,6 +23,7 @@ from .genesis_embed_server_globals import (
     MODEL_OPTIONS,
     PRECISION_OPTIONS,
     QUANTIZATION_OPTIONS,
+    TOO_LONG_POLICY_OPTIONS,
     batch_history,
     current_settings,
     embedding_history,
@@ -46,6 +47,7 @@ class AdminSettingsPayload(BaseModel):
     batch_max_chars: int
     encode_batch_size: int = 0
     max_seq_length: int = 0
+    too_long_policy: str = "reject"
     precision: str
     quantization: str = "none"
     compile_mode: str
@@ -97,6 +99,7 @@ def _settings_options() -> Dict[str, List[Dict[str, str]]]:
         "backends": BACKEND_OPTIONS,
         "precisions": PRECISION_OPTIONS,
         "quantizations": QUANTIZATION_OPTIONS,
+        "too_long_policies": TOO_LONG_POLICY_OPTIONS,
         "compile_modes": COMPILE_OPTIONS,
     }
 

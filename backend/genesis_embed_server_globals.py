@@ -168,6 +168,11 @@ QUANTIZATION_OPTIONS = [
 
 MAX_SEQ_LENGTH_LIMIT = 32768
 
+TOO_LONG_POLICY_OPTIONS = [
+    {"label": "Reject with HTTP 400", "value": "reject"},
+    {"label": "Truncate silently", "value": "truncate"},
+]
+
 COMPILE_OPTIONS = [
     {"label": "Off", "value": "off"},
     {"label": "Regional (fast warmup)", "value": "regional"},

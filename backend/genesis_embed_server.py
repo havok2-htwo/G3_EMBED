@@ -25,8 +25,8 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8777
 
 
-async def _encode_async(model_id: str, texts: list[str]):
-    return await asyncio.to_thread(encode_texts, model_id, texts)
+async def _encode_async(model_id: str, texts: list[str], settings: dict | None = None):
+    return await asyncio.to_thread(encode_texts, model_id, texts, settings)
 
 
 def _preload_default_model(model_id: str, cache_path: str) -> None:

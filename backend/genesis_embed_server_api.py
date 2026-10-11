@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import datetime, timezone
 from typing import Any, List, Union
 
@@ -17,7 +18,13 @@ from .genesis_embed_server_globals import (
     history_lock,
     settings_lock,
 )
-from .genesis_embed_server_runtime import EncodeResult, encode_texts, get_runtime_status
+from .genesis_embed_server_runtime import (
+    EncodeResult,
+    InputTooLongError,
+    encode_texts,
+    get_runtime_status,
+    validate_input_lengths,
+)
 from .genesis_embed_server_storage import log_embedding
 
 
@@ -29,6 +36,13 @@ class EmbedRequest(BaseModel):
         description=(
             "'query' or 'document' prepends the model's query/document prompt (e.g. 'query: ' for E5). "
             "Aliases: passage, search_query, search_document. Omit or use any other value to embed the raw text."
+        ),
+    )
+    truncate: bool | None = Field(
+        default=None,
+        description=(
+            "true cuts texts at the model's token limit; false rejects them with HTTP 400. "
+            "Omit to use the server's too_long_policy setting (default: reject)."
         ),
     )
 
@@ -59,6 +73,13 @@ class OpenAIEmbeddingRequest(BaseModel):
         description=(
             "'query' or 'document' prepends the model's query/document prompt (e.g. 'query: ' for E5). "
             "Aliases: passage, search_query, search_document. Omit or use any other value to embed the raw text."
+        ),
+    )
+    truncate: bool | None = Field(
+        default=None,
+        description=(
+            "true cuts texts at the model's token limit; false rejects them with HTTP 400. "
+            "Omit to use the server's too_long_policy setting (default: reject)."
         ),
     )
 
@@ -122,6 +143,7 @@ async def embed_texts_for_request(
     route: str,
     force_direct: bool = False,
     input_type: str | None = None,
+    truncate: bool | None = None,
 ) -> tuple[EncodeResult, bool]:
     if not inputs:
         raise HTTPException(status_code=400, detail="inputs must not be empty")
@@ -135,12 +157,25 @@ async def embed_texts_for_request(
 
     source_ip = request.client.host if request.client else "unknown"
     batched = bool(settings_snapshot.get("batching_enabled")) and not force_direct
+    if truncate is None:
+        truncate = settings_snapshot.get("too_long_policy") == "truncate"
     try:
+        validation_load_ms = 0.0
+        if not truncate:
+            # Before batching, so an oversized text never fails other clients' requests in the same batch.
+            validation_load_ms = await asyncio.to_thread(validate_input_lengths, effective_model, inputs, settings_snapshot)
         if batched and getattr(request.app.state, "embed_batch_manager", None) is not None:
             result = await request.app.state.embed_batch_manager.enqueue(effective_model, inputs, settings_snapshot)
         else:
             result = await asyncio.to_thread(encode_texts, effective_model, inputs, settings_snapshot)
             batched = False
+        if validation_load_ms:
+            # The model was loaded during validation; report that time like a load inside encode.
+            result = dataclasses.replace(
+                result,
+                load_duration_ms=round(result.load_duration_ms + validation_load_ms, 3),
+                total_duration_ms=round(result.total_duration_ms + validation_load_ms, 3),
+            )
     except Exception as exc:
         entry = {
             "timestamp": _now_iso(),
@@ -154,6 +189,17 @@ async def embed_texts_for_request(
             "batched": batched,
         }
         _record_history(entry)
+        if isinstance(exc, InputTooLongError):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "input_too_long",
+                    "message": f"{exc}. Split the text, or send \"truncate\": true to cut it at the limit.",
+                    "model_id": exc.model_id,
+                    "max_tokens": exc.max_tokens,
+                    "inputs": exc.too_long,
+                },
+            ) from exc
         raise HTTPException(status_code=500, detail=f"embedding failed: {exc}") from exc
 
     entry = {
@@ -207,6 +253,7 @@ def create_api(app: FastAPI) -> FastAPI:
             inputs=_normalize_inputs(payload.inputs),
             route="/embed",
             input_type=payload.input_type,
+            truncate=payload.truncate,
         )
         if api_key_id:
             get_auth_store().record_api_key_usage(api_key_id, result.input_count)
@@ -236,6 +283,7 @@ def create_api(app: FastAPI) -> FastAPI:
             inputs=_normalize_inputs(payload.input),
             route="/v1/embeddings",
             input_type=payload.input_type,
+            truncate=payload.truncate,
         )
         if api_key_id:
             get_auth_store().record_api_key_usage(api_key_id, result.input_count)

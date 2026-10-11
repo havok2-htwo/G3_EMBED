@@ -52,6 +52,25 @@ Response:
 }
 ```
 
+#### Texts over the token limit
+
+By default (`too_long_policy: reject`), a request is rejected when any input, counted with its prompt and special tokens, exceeds the model's token limit (`max_seq_length`, e.g. 4096 for EmbeddingGemma 2, 512 for E5). Nothing is embedded; only that request fails.
+
+```json
+HTTP 400
+{
+  "detail": {
+    "error": "input_too_long",
+    "message": "1 input(s) exceed the token limit of 4096 for 'google/embeddinggemma-2'. Split the text, or send \"truncate\": true to cut it at the limit.",
+    "model_id": "google/embeddinggemma-2",
+    "max_tokens": 4096,
+    "inputs": [{"index": 1, "tokens": 6004}]
+  }
+}
+```
+
+`index` is the position in `inputs`. Send `"truncate": true` to cut texts at the limit instead, or `"truncate": false` to reject even when the server is set to `truncate`.
+
 ### `GET /v1/models`
 
 OpenAI-compatible model list.
@@ -70,7 +89,7 @@ Request:
 }
 ```
 
-`input_type` works as for `POST /embed` (non-standard extension; OpenAI clients can send it as an extra body field).
+`input_type` and `truncate` work as for `POST /embed` (non-standard extensions; OpenAI clients can send them as extra body fields). Texts over the token limit return the same HTTP 400 `input_too_long` error.
 
 Response uses OpenAI's `object`, `data`, `model`, and `usage` shape. Embeddings are returned as float arrays.
 
@@ -143,7 +162,8 @@ Updates settings:
 - `batch_max_texts`
 - `batch_max_chars`
 - `encode_batch_size` (texts per forward pass, `0` = model default)
-- `max_seq_length` (token truncation per text, `0` = model default, clamped to the model's native limit)
+- `max_seq_length` (token limit per text, `0` = model default, clamped to the model's native limit)
+- `too_long_policy` (`reject` = HTTP 400 for texts over the limit, default; `truncate` = cut silently)
 - `precision`
 - `quantization` (`none`, `int8`, `nf4`; PyTorch CUDA only)
 - `compile_mode` (`off`, `regional`, `full`)

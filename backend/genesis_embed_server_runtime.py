@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import logging
 import math
@@ -299,6 +300,7 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
             "choice": choice,
             "native_max_seq_length": native_max_seq_length,
             "encode_lock": threading.Lock(),
+            "count_lock": threading.Lock(),
         }
         _last_runtime_error = None
         print(
@@ -375,6 +377,56 @@ def build_runtime_key(model_id: str, settings: dict[str, Any] | None = None) -> 
         choice,
         settings_snapshot,
     )
+
+
+class InputTooLongError(ValueError):
+    """One or more inputs exceed the model's effective token window."""
+
+    def __init__(self, model_id: str, max_tokens: int, too_long: list[dict[str, int]]):
+        self.model_id = model_id
+        self.max_tokens = max_tokens
+        self.too_long = too_long
+        super().__init__(
+            f"{len(too_long)} input(s) exceed the token limit of {max_tokens} for '{model_id}'"
+        )
+
+
+def validate_input_lengths(model_id: str, texts: list[str], settings: dict[str, Any] | None = None) -> float:
+    """Raise InputTooLongError for texts longer than the effective window (prompt and special tokens included).
+
+    Loads the model if needed and returns the load time in ms. Call it before batching so one oversized
+    text only fails its own request.
+    """
+    runtime_key, choice, settings_snapshot = build_runtime_key(model_id, settings)
+    with _model_cache_lock:
+        model, load_ms = _load_model(runtime_key, settings_snapshot, choice)
+        cache_entry = _model_cache[runtime_key]
+    max_tokens = _effective_max_seq_length(
+        runtime_key.model_id,
+        settings_snapshot,
+        int(cache_entry.get("native_max_seq_length") or 0),
+    )
+    tokenizer = getattr(model.tokenizer, "tokenizer", model.tokenizer)
+    if not max_tokens or tokenizer is None:
+        return load_ms
+    # A private copy: the shared (Rust-backed) tokenizer is mutated with truncation settings by a concurrent
+    # model.encode and must not be called with different settings outside encode_lock.
+    with cache_entry["count_lock"]:
+        count_tokenizer = cache_entry.get("count_tokenizer")
+        if count_tokenizer is None:
+            count_tokenizer = copy.deepcopy(tokenizer)
+            cache_entry["count_tokenizer"] = count_tokenizer
+        input_ids = count_tokenizer(
+            [str(text or "") for text in texts], add_special_tokens=True, truncation=False, verbose=False
+        )["input_ids"]
+    too_long = [
+        {"index": index, "tokens": len(ids)}
+        for index, ids in enumerate(input_ids)
+        if len(ids) > max_tokens
+    ]
+    if too_long:
+        raise InputTooLongError(runtime_key.model_id, max_tokens, too_long)
+    return load_ms
 
 
 def encode_texts(model_id: str, texts: list[str], settings: dict[str, Any] | None = None) -> EncodeResult:

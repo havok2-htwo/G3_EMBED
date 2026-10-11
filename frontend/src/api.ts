@@ -14,6 +14,7 @@ export type AdminSettings = {
   batch_max_chars: number;
   encode_batch_size: number;
   max_seq_length: number;
+  too_long_policy: string;
   precision: string;
   quantization: string;
   compile_mode: string;
@@ -70,6 +71,7 @@ export type SettingsResponse = {
     backends: AdminOption[];
     precisions: AdminOption[];
     quantizations: AdminOption[];
+    too_long_policies: AdminOption[];
     compile_modes: AdminOption[];
   };
   models: ManagedModel[];
@@ -167,6 +169,20 @@ export type CreatedApiKey = {
  * All admin requests carry the httpOnly session cookie (same-origin). 401 -> not logged
  * in; 403 password_change_required -> forced password change.
  */
+// Errors such as input_too_long return an object detail with a human-readable message.
+function describeErrorDetail(detail: unknown): string | undefined {
+  if (detail === undefined || detail === null) {
+    return undefined;
+  }
+  if (typeof detail === "string") {
+    return detail;
+  }
+  if (typeof detail === "object" && "message" in detail) {
+    return String((detail as { message: unknown }).message);
+  }
+  return JSON.stringify(detail);
+}
+
 async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
   const nextHeaders = new Headers(init?.headers ?? {});
   if (!(init?.body instanceof FormData) && !nextHeaders.has("Content-Type")) {
@@ -191,9 +207,9 @@ async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({ detail: `HTTP ${response.status}` }))) as {
-      detail?: string;
+      detail?: unknown;
     };
-    throw new Error(payload.detail ?? `HTTP ${response.status}`);
+    throw new Error(describeErrorDetail(payload.detail) ?? `HTTP ${response.status}`);
   }
 
   return response.json() as Promise<T>;

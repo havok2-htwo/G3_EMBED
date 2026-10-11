@@ -98,7 +98,8 @@ Response includes `model_id`, `dimension`, `vectors`, backend/device metadata, b
 
 ## Token Window, GPU Batch Size and Quantization
 
-- `max_seq_length` ("Max Tokens / Text"): truncation limit per text. `0` uses the model default (EmbeddingGemma 2 and Qwen3: 4096, others: their native limit). Values above a model's limit are clamped (E5: 512, EmbeddingGemma 2: 8192).
+- `too_long_policy` ("Texts Over Token Limit"): `reject` (default) answers HTTP 400 `input_too_long` when any text, including its prompt and special tokens, exceeds the token limit; `truncate` cuts it silently. Requests can override this with `"truncate": true/false`. Oversized texts are rejected before batching, so they never fail other clients' requests.
+- `max_seq_length` ("Max Tokens / Text"): token limit per text. `0` uses the model default (EmbeddingGemma 2 and Qwen3: 4096, others: their native limit). Values above a model's limit are clamped (E5: 512, EmbeddingGemma 2: 8192).
 - `encode_batch_size` ("GPU Batch Size"): texts per forward pass. `0` uses the model default (EmbeddingGemma 2: 4, Qwen3: 2, others: `batch_max_texts`). `batch_max_texts` / `batch_max_chars` only control how queued requests are merged.
 - `quantization`: `none`, `int8` or `nf4` via bitsandbytes. Applied only to Qwen3 models on PyTorch CUDA; ignored for other models.
 

@@ -16,6 +16,7 @@ from .genesis_embed_server_globals import (
     PRECISION_OPTIONS,
     QUANTIZATION_OPTIONS,
     SETTINGS_FILE,
+    TOO_LONG_POLICY_OPTIONS,
 )
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -29,6 +30,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batch_max_chars": 64000,
     "encode_batch_size": 0,
     "max_seq_length": 0,
+    "too_long_policy": "reject",
     "precision": "auto",
     "quantization": "none",
     "compile_mode": "off",
@@ -93,6 +95,7 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             maximum=MAX_SEQ_LENGTH_LIMIT,
             default=DEFAULT_SETTINGS["max_seq_length"],
         ),
+        "too_long_policy": _valid_option(TOO_LONG_POLICY_OPTIONS, source.get("too_long_policy"), "reject"),
         "precision": _valid_option(PRECISION_OPTIONS, source.get("precision"), "auto"),
         "quantization": _valid_option(QUANTIZATION_OPTIONS, source.get("quantization"), "none"),
         "compile_mode": _valid_option(COMPILE_OPTIONS, source.get("compile_mode"), "off"),

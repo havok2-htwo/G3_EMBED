@@ -19,10 +19,12 @@ class EmbedBatchRequest:
     runtime_key: RuntimeKey
     future: asyncio.Future[EncodeResult]
     enqueued_at: float
+    # The request's settings snapshot, so the batch encodes with the token window its texts were validated against.
+    settings: dict[str, Any]
 
 
 class EmbedBatchManager:
-    def __init__(self, encoder: Callable[[str, list[str]], Awaitable[EncodeResult]]):
+    def __init__(self, encoder: Callable[[str, list[str], dict[str, Any]], Awaitable[EncodeResult]]):
         self._encoder = encoder
         self._queue: asyncio.Queue[EmbedBatchRequest] = asyncio.Queue()
         self._worker_task: asyncio.Task[None] | None = None
@@ -58,6 +60,7 @@ class EmbedBatchManager:
             runtime_key=runtime_key,
             future=future,
             enqueued_at=time.perf_counter(),
+            settings=dict(settings),
         )
         await self._queue.put(request)
         with batch_state_lock:
@@ -91,6 +94,7 @@ class EmbedBatchManager:
                 candidate_chars = sum(len(text) for text in candidate.texts)
                 can_join = (
                     candidate.runtime_key == first.runtime_key
+                    and candidate.settings.get("max_seq_length") == first.settings.get("max_seq_length")
                     and current_texts + candidate_texts <= max_texts
                     and current_chars + candidate_chars <= max_chars
                 )
@@ -141,7 +145,7 @@ class EmbedBatchManager:
             cursor = next_cursor
 
         try:
-            combined = await self._encoder(group[0].model_id, all_texts)
+            combined = await self._encoder(group[0].model_id, all_texts, group[0].settings)
             for request, start, end in spans:
                 sliced = EncodeResult(
                     model_id=combined.model_id,
