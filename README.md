@@ -140,7 +140,18 @@ On CUDA the runtime disables the `enable_gqa` SDPA path in transformers. Otherwi
 
 `LostGentoo/Qwen3-Embedding-8B-AWQ` (compressed-tensors) is not included: with transformers 4.x it is decompressed to BF16 at runtime (~18 GB VRAM) and diverged noticeably from the BF16 reference. Use `Qwen/Qwen3-Embedding-8B` with `nf4` or `int8` instead.
 
-`torch.compile` is exposed as an optional setting and defaults to `off`. It is skipped automatically when Triton is not installed (the default on Windows) and for bitsandbytes-quantized models.
+## torch.compile
+
+`compile_mode` (PyTorch CUDA/XPU only, default `off`):
+
+- `regional`: compiles each transformer layer once and reuses the graph for all layers. Short warmup, roughly 2.5x faster for EmbeddingGemma 2 on varied-length inputs.
+- `full`: compiles the whole model. Highest throughput (roughly 3.5x for EmbeddingGemma 2) but a warmup of about 1-3 minutes on every model load.
+
+Compilation uses `dynamic=True`, so varying text lengths and batch sizes do not trigger recompiles, and it runs as a warmup while the model loads (covering short/long and padded/unpadded batches), not on the first request. A rare remaining input variant may still compile once on first use. Graphs that fail to compile fall back to eager.
+
+At server start the default model is preloaded in the background when it is already downloaded, so a long `full` warmup does not land on the first request. `/health` stays responsive meanwhile; embedding requests wait until the model is ready. Compile is skipped for bitsandbytes-quantized models and when Triton is missing.
+
+Triton: Linux CUDA builds of PyTorch include it. On Windows, `tools/install_torch_backend.py` installs the `triton-windows` release that matches the installed torch minor version (torch 2.11 -> triton 3.7). Set `GENESIS_SKIP_TRITON_WINDOWS=1` to skip it.
 
 ## OpenVINO
 

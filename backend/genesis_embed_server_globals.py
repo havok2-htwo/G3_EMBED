@@ -170,7 +170,8 @@ MAX_SEQ_LENGTH_LIMIT = 32768
 
 COMPILE_OPTIONS = [
     {"label": "Off", "value": "off"},
-    {"label": "Reduce overhead", "value": "reduce-overhead"},
+    {"label": "Regional (fast warmup)", "value": "regional"},
+    {"label": "Full (max throughput, slow warmup)", "value": "full"},
 ]
 
 settings_lock = threading.RLock()

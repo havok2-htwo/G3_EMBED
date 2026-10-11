@@ -6,7 +6,9 @@
 - Added `google/embeddinggemma-2` and made it the default model (768 dims, up to 8192 tokens, default window 4096).
 - Added optional `input_type` (`query` / `document`, aliases `passage`, `search_query`, `search_document`) to `/embed` and `/v1/embeddings` to apply each model's prompts.
 - PyTorch CPU loads models in float32 (transformers 5 would otherwise use the checkpoint's bf16); `precision=bfloat16` is honored.
-- `torch.compile` is skipped when Triton is not installed.
+- `torch.compile` modes `regional` (per-layer, short warmup) and `full` (whole model, highest throughput) replace `reduce-overhead`; both use `dynamic=True`, warm up at model load and fall back to eager on errors. Saved `reduce-overhead` settings map to `off` (on Windows without Triton it never took effect; re-select a mode after upgrading).
+- The default model is preloaded (and compiled) in the background at server start if it is already in the local cache.
+- `install_torch_backend.py` installs the matching `triton-windows` on Windows CUDA builds (`GENESIS_SKIP_TRITON_WINDOWS=1` skips it). `torch.compile` is skipped when Triton is missing.
 - Docker first boot no longer pins a default model; the code default applies.
 - Quantization now applies only to Qwen3 models.
 - Removed `optimum-intel` (no transformers 5.18+ support yet); OpenVINO targets fall back to PyTorch and `/health` reports `openvino_backend_available`.

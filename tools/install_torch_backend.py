@@ -9,6 +9,7 @@ from typing import Iterable
 
 
 TORCH_VARIANT_ENV = "GENESIS_TORCH_VARIANT"
+SKIP_TRITON_ENV = "GENESIS_SKIP_TRITON_WINDOWS"
 DEFAULT_TORCH_VARIANT = "auto"
 TORCH_PACKAGES = ["torch", "torchvision", "torchaudio"]
 PYTORCH_INDEX_BY_VARIANT = {
@@ -161,6 +162,56 @@ def build_missing_packages_command(python_executable: str, variant: str) -> list
     return [python_executable, "-m", "pip", "install", *pinned, *missing, "--index-url", index_url]
 
 
+def _installed_version(python_executable: str, package: str) -> str | None:
+    # stdout only (run_command merges stderr, where warnings could end up as the "version").
+    try:
+        completed = subprocess.run(
+            [python_executable, "-I", "-c", f"import importlib.metadata as m; print(m.version({package!r}))"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    lines = completed.stdout.strip().splitlines() if completed.returncode == 0 else []
+    return lines[-1].strip() if lines else None
+
+
+def triton_windows_spec(torch_version: str) -> str | None:
+    """Each torch minor pairs with one triton minor (2.10 -> 3.6, 2.11 -> 3.7, ...)."""
+    try:
+        major, minor = (int(part) for part in torch_version.split("+", 1)[0].split(".")[:2])
+    except ValueError:
+        return None
+    if major != 2 or minor < 6:
+        return None
+    triton_minor = minor - 4
+    return f"triton-windows>=3.{triton_minor},<3.{triton_minor + 1}"
+
+
+def ensure_windows_triton(python_executable: str, dry_run: bool) -> None:
+    """Install triton-windows for torch.compile on Windows CUDA builds (Linux CUDA wheels ship Triton)."""
+    if platform.system() != "Windows" or os.getenv(SKIP_TRITON_ENV, "0").lower() in {"1", "true", "yes"}:
+        return
+    torch_version = _installed_version(python_executable, "torch")
+    if not torch_version or "+cu" not in torch_version:
+        return
+    spec = triton_windows_spec(torch_version)
+    if spec is None:
+        return
+    triton_version = _installed_version(python_executable, "triton-windows")
+    wanted_prefix = spec.split(">=", 1)[1].split(",", 1)[0] + "."
+    if triton_version and triton_version.startswith(wanted_prefix):
+        print(f"[Torch Install] triton-windows {triton_version} matches torch {torch_version}.", flush=True)
+        return
+    command = [python_executable, "-m", "pip", "install", spec]
+    print(f"[Torch Install] torch.compile support: {print_command(command)}", flush=True)
+    if dry_run:
+        return
+    if subprocess.run(command, check=False).returncode != 0:
+        print("[Torch Install] Warning: triton-windows install failed; torch.compile stays disabled.", flush=True)
+
+
 def print_command(parts: Iterable[str]) -> str:
     return " ".join(f'"{part}"' if " " in part else part for part in parts)
 
@@ -203,6 +254,7 @@ def main() -> int:
         missing_command = build_missing_packages_command(args.python_executable, resolved_variant)
         if missing_command is None:
             print("[Torch Install] All torch packages present.", flush=True)
+            ensure_windows_triton(args.python_executable, args.dry_run)
             return 0
         command = missing_command
     else:
@@ -215,6 +267,7 @@ def main() -> int:
     print(f"[Torch Install] Command: {print_command(command)}", flush=True)
 
     if args.dry_run:
+        print("[Torch Install] triton-windows (Windows CUDA) is matched to the installed torch after installing.", flush=True)
         return 0
 
     completed = subprocess.run(command, check=False)
@@ -227,6 +280,7 @@ def main() -> int:
         return completed.returncode
 
     print(f"[Torch Install] Installed variant '{resolved_variant}' successfully.", flush=True)
+    ensure_windows_triton(args.python_executable, args.dry_run)
     return 0
 
 

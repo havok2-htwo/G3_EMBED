@@ -59,14 +59,17 @@ if exist "%VENV_PYTHON%" if "%NEEDS_PY_DEPS%"=="0" (
     if errorlevel 1 set "NEEDS_PY_DEPS=1"
 )
 
-if "%NEEDS_PY_DEPS%"=="1" (
-    echo Pruefe fehlende PyTorch-Pakete ...
+if exist "%VENV_PYTHON%" (
+    rem Cheap when complete: installs missing torch packages and a matching triton-windows for torch.compile.
     call "%VENV_PYTHON%" "%CD%\tools\install_torch_backend.py" --python "%VENV_PYTHON%" --only-missing
     if errorlevel 1 (
         echo FEHLER: PyTorch-Paketinstallation fehlgeschlagen.
         pause
         exit /b 1
     )
+)
+
+if "%NEEDS_PY_DEPS%"=="1" (
     echo Installiere/Aktualisiere Python-Abhaengigkeiten ...
     call "%VENV_PIP%" install -r requirements.txt
     if errorlevel 1 (

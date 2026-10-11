@@ -146,7 +146,7 @@ Updates settings:
 - `max_seq_length` (token truncation per text, `0` = model default, clamped to the model's native limit)
 - `precision`
 - `quantization` (`none`, `int8`, `nf4`; PyTorch CUDA only)
-- `compile_mode`
+- `compile_mode` (`off`, `regional`, `full`)
 - `warmup_on_load`
 - `huggingface_token`
 

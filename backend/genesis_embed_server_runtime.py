@@ -146,33 +146,97 @@ def _model_kwargs_for_precision(
     return kwargs
 
 
-def _maybe_compile_sentence_transformer(model: Any, compile_mode: str, choice: RuntimeChoice, quantization: str = "none") -> Any:
+def _transformer_layer_stack(module: Any) -> Any:
+    """Largest ModuleList of text transformer layers (skips vision/audio towers of multimodal models)."""
+    import torch
+
+    candidates = [
+        child
+        for name, child in module.named_modules()
+        if isinstance(child, torch.nn.ModuleList)
+        and len(child) >= 2
+        and not any(part in name for part in ("vision", "audio"))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda layers: sum(parameter.numel() for parameter in layers.parameters()))
+
+
+def _maybe_compile_sentence_transformer(model: Any, compile_mode: str, choice: RuntimeChoice, quantization: str = "none") -> bool:
+    """Compile in place. "regional" compiles each transformer layer (fast startup, reused graph);
+    "full" compiles the whole model (highest throughput, much longer warmup). Returns True if compiled."""
     if compile_mode == "off" or choice.backend != "pytorch" or choice.device == "cpu":
-        return model
+        return False
     if quantization != "none":
         print("[G3_EMBED] torch.compile skipped: not supported with bitsandbytes quantization", flush=True)
-        return model
+        return False
     try:
+        import importlib.util
+
         import torch
 
         if not hasattr(torch, "compile"):
-            return model
-        import importlib.util
-
-        # Inductor needs Triton on CUDA/XPU (not installed by default on Windows); compile would fail on first encode.
+            return False
+        # Inductor needs Triton on CUDA/XPU (triton-windows on Windows); compile would fail on first encode.
         if importlib.util.find_spec("triton") is None:
             print("[G3_EMBED] torch.compile skipped: Triton is not installed", flush=True)
-            return model
+            return False
+        import torch._dynamo
+
+        # Fall back to eager instead of failing requests if a graph cannot be compiled.
+        torch._dynamo.config.suppress_errors = True
+        # The default budget (8 per code object) is shared across all models loaded in this process.
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+        torch._dynamo.config.accumulated_recompile_limit = max(torch._dynamo.config.accumulated_recompile_limit, 1024)
         first_module = model._first_module()
         # sentence-transformers 6 exposes auto_model read-only; the module itself lives in .model.
         attribute = "model" if isinstance(getattr(first_module, "model", None), torch.nn.Module) else "auto_model"
         inner_model = getattr(first_module, attribute, None)
         if inner_model is None:
-            return model
-        setattr(first_module, attribute, torch.compile(inner_model, mode=compile_mode))
+            return False
+        # Embeddings never need a KV cache; with it, each Qwen3 layer guards on its own layer index and
+        # regional compile builds one graph per layer instead of one shared graph.
+        config = getattr(inner_model, "config", None)
+        for sub_config in (config, getattr(config, "text_config", None)):
+            if sub_config is not None and hasattr(sub_config, "use_cache"):
+                sub_config.use_cache = False
+        if compile_mode == "regional":
+            layers = _transformer_layer_stack(inner_model)
+            if layers is None:
+                print("[G3_EMBED] torch.compile skipped: no transformer layer stack found", flush=True)
+                return False
+            for layer in layers:
+                layer.compile(dynamic=True)
+        else:
+            setattr(first_module, attribute, torch.compile(inner_model, dynamic=True))
+        return True
     except Exception as exc:
         print(f"[G3_EMBED] torch.compile skipped: {exc}", flush=True)
-    return model
+        return False
+
+
+def _warmup_compiled_model(model: Any, max_seq_length: int | None, encode_batch_size: int) -> None:
+    """Trigger compilation at load time instead of on the first requests.
+
+    Batch size 1 is specialized, and attention masks differ between short/long and padded/unpadded
+    batches (sliding-window layers), so warm up each combination the configured batch size can produce.
+    """
+    started = time.perf_counter()
+    if max_seq_length:
+        model.max_seq_length = max_seq_length
+    long_text = "warmup " * 2048
+    batches: list[list[str]] = [["warmup"], [long_text]]
+    if encode_batch_size >= 2:
+        batches += [["warmup", long_text], ["warmup", "warmup"], [long_text, long_text]]
+    try:
+        for texts in batches:
+            model.encode(texts, batch_size=len(texts), convert_to_numpy=True, show_progress_bar=False)
+    except Exception as exc:
+        # Keep the model usable; anything not compiled here compiles lazily on first use.
+        print(f"[G3_EMBED] torch.compile warmup failed: {exc}", flush=True)
+        _release_cuda_cache()
+        return
+    print(f"[G3_EMBED] torch.compile warmup finished in {time.perf_counter() - started:.1f} s", flush=True)
 
 
 def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: RuntimeChoice) -> tuple[Any, float]:
@@ -213,12 +277,18 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
         # Some tokenizers report a placeholder limit (EmbeddingGemma 2: 1e30); cap it at the spec or global limit.
         spec_limit = int(get_model_spec(runtime_key.model_id).get("max_seq_length") or MAX_SEQ_LENGTH_LIMIT)
         native_max_seq_length = min(int(getattr(model, "max_seq_length", 0) or 0) or spec_limit, spec_limit)
-        model = _maybe_compile_sentence_transformer(model, runtime_key.compile_mode, choice, runtime_key.quantization)
+        compiled = _maybe_compile_sentence_transformer(model, runtime_key.compile_mode, choice, runtime_key.quantization)
         if _is_cuda_pytorch(choice):
             # Quantized loading stages full-precision shards on the GPU; release that cache.
             _release_cuda_cache()
 
-        if settings.get("warmup_on_load"):
+        if compiled:
+            _warmup_compiled_model(
+                model,
+                _effective_max_seq_length(runtime_key.model_id, settings, native_max_seq_length),
+                _effective_encode_batch_size(runtime_key.model_id, settings, 2),
+            )
+        elif settings.get("warmup_on_load"):
             model.encode(["warmup"], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
 
         load_ms = (time.perf_counter() - load_started) * 1000
@@ -379,21 +449,22 @@ def compare_vectors(vector_a: list[float], vector_b: list[float]) -> dict[str, f
 
 
 def get_runtime_status() -> dict[str, Any]:
-    with _model_cache_lock:
-        loaded_models = [
-            {
-                "model_id": key.model_id,
-                "backend": key.backend,
-                "device": key.device,
-                "precision": key.precision,
-                "compile_mode": key.compile_mode,
-                "quantization": key.quantization,
-                "max_seq_length": getattr(value.get("model"), "max_seq_length", None),
-                "loaded_at": value.get("loaded_at"),
-                "load_duration_ms": value.get("load_duration_ms"),
-            }
-            for key, value in _model_cache.items()
-        ]
+    # No _model_cache_lock: it is held for a whole load + compile warmup (minutes in "full" mode) and this
+    # runs on the event loop for /health and admin pages. Copying the dict items is atomic under the GIL.
+    loaded_models = [
+        {
+            "model_id": key.model_id,
+            "backend": key.backend,
+            "device": key.device,
+            "precision": key.precision,
+            "compile_mode": key.compile_mode,
+            "quantization": key.quantization,
+            "max_seq_length": getattr(value.get("model"), "max_seq_length", None),
+            "loaded_at": value.get("loaded_at"),
+            "load_duration_ms": value.get("load_duration_ms"),
+        }
+        for key, value in list(_model_cache.items())
+    ]
     with settings_lock:
         settings_snapshot = dict(current_settings)
     choice = resolve_runtime_choice(settings_snapshot)

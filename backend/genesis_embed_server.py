@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Union
@@ -14,6 +15,7 @@ from .genesis_embed_server_admin import create_admin_api
 from .genesis_embed_server_api import create_api
 from .genesis_embed_server_batching import EmbedBatchManager
 from .genesis_embed_server_globals import current_settings
+from .genesis_embed_server_model_manager import list_model_statuses
 from .genesis_embed_server_runtime import encode_texts
 from .genesis_embed_server_storage import load_settings
 
@@ -25,6 +27,23 @@ DEFAULT_PORT = 8777
 
 async def _encode_async(model_id: str, texts: list[str]):
     return await asyncio.to_thread(encode_texts, model_id, texts)
+
+
+def _preload_default_model(model_id: str, cache_path: str) -> None:
+    """Load (and compile/warm up) the default model in the background so the first request does not pay for it.
+
+    Only runs when the model is already in the local cache, so startup never triggers a download. Runs on a
+    daemon thread so a long compile warmup never blocks server shutdown.
+    """
+    try:
+        statuses = list_model_statuses(cache_path)
+        if not any(status["id"] == model_id and status["status"] == "ready" for status in statuses):
+            print(f"[G3_EMBED] Preload skipped: '{model_id}' is not in the local model cache.", file=sys.stderr)
+            return
+        encode_texts(model_id, ["warmup"])
+        print(f"[G3_EMBED] Preloaded default model '{model_id}'.", file=sys.stderr)
+    except Exception as exc:
+        print(f"[G3_EMBED] Preload of '{model_id}' failed: {exc}", file=sys.stderr)
 
 
 async def startup_server(app: FastAPI) -> None:
@@ -40,6 +59,12 @@ async def startup_server(app: FastAPI) -> None:
     batch_manager = EmbedBatchManager(_encode_async)
     app.state.embed_batch_manager = batch_manager
     await batch_manager.start()
+    threading.Thread(
+        target=_preload_default_model,
+        args=(str(current_settings.get("default_model") or ""), str(current_settings.get("model_cache_path", ""))),
+        name="g3-embed-preload",
+        daemon=True,
+    ).start()
 
 
 async def shutdown_server(app: FastAPI) -> None:
