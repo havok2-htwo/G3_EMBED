@@ -51,6 +51,7 @@ from .genesis_embed_server_runtime import (
     encode_inputs,
     encode_texts,
     get_runtime_status,
+    reject_too_long_before_load,
     reported_max_seq_length,
     resolve_backend,
 )
@@ -307,6 +308,8 @@ async def _embed_texts(
     counted: TokenCounts | None = None
     if not truncate:
         # Before batching, so an oversized text never fails other clients' requests in the same batch.
+        # The tokenizer alone rejects first, so a model that is not loaded is not loaded just to fail.
+        await asyncio.to_thread(reject_too_long_before_load, model_id, texts, settings)
         counted = await asyncio.to_thread(count_input_tokens, model_id, texts, settings)
         _raise_if_too_long(counted, lambda index: True)
     if batched and getattr(request.app.state, "embed_batch_manager", None) is not None:

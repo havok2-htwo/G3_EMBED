@@ -17,6 +17,8 @@ BATCH_HISTORY_MAX_LEN = 100
 DEFAULT_MODEL_ID = "google/embeddinggemma-2"
 QWEN3_QUERY_PROMPT = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
 
+# max_seq_length: native token window. With it, over-limit texts for a model that is not loaded are rejected
+# by its tokenizer alone (no model load) and /v1/models reports max_model_len before loading.
 MODEL_SPECS: Dict[str, Dict[str, Any]] = {
     "google/embeddinggemma-2": {
         "label": "EmbeddingGemma 2",
@@ -47,6 +49,7 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 0.47,
         "dimensions": 384,
         "recommended_backend": "auto",
+        "max_seq_length": 512,
         "query_prompt": "query: ",
         "document_prompt": "passage: ",
         "notes": "Fast multilingual embedding model.",
@@ -58,6 +61,7 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 1.1,
         "dimensions": 768,
         "recommended_backend": "auto",
+        "max_seq_length": 512,
         "query_prompt": "query: ",
         "document_prompt": "passage: ",
         "notes": "Balanced multilingual quality and latency.",
@@ -69,6 +73,7 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 2.2,
         "dimensions": 1024,
         "recommended_backend": "cuda",
+        "max_seq_length": 512,
         "query_prompt": "query: ",
         "document_prompt": "passage: ",
         "notes": "Higher quality multilingual baseline.",
@@ -80,6 +85,7 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 2.3,
         "dimensions": 1024,
         "recommended_backend": "cuda",
+        "max_seq_length": 8192,
         "notes": "Multilingual dense retrieval model.",
     },
     "sentence-transformers/all-MiniLM-L6-v2": {
@@ -89,6 +95,7 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 0.09,
         "dimensions": 384,
         "recommended_backend": "cpu",
+        "max_seq_length": 256,
         "notes": "Tiny English diagnostic model for quick checks.",
     },
     "BAAI/bge-multilingual-gemma2": {
@@ -107,6 +114,7 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 1.2,
         "dimensions": 1024,
         "recommended_backend": "cuda",
+        "max_seq_length": 32768,
         "preferred_dtype": "bfloat16",
         "quantizable": True,
         "query_prompt": QWEN3_QUERY_PROMPT,
@@ -121,6 +129,8 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 8.1,
         "dimensions": 2560,
         "recommended_backend": "cuda",
+        # Native 40960, capped at MAX_SEQ_LENGTH_LIMIT.
+        "max_seq_length": 32768,
         "preferred_dtype": "bfloat16",
         "quantizable": True,
         "query_prompt": QWEN3_QUERY_PROMPT,
@@ -135,6 +145,8 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "approx_size_gb": 15.1,
         "dimensions": 4096,
         "recommended_backend": "cuda",
+        # Native 40960, capped at MAX_SEQ_LENGTH_LIMIT.
+        "max_seq_length": 32768,
         "preferred_dtype": "bfloat16",
         "quantizable": True,
         "query_prompt": QWEN3_QUERY_PROMPT,

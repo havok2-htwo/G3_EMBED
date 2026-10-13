@@ -6,6 +6,7 @@ import logging
 import math
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, List, Sequence
 
@@ -720,12 +721,71 @@ def count_input_tokens(model_id: str, inputs: Sequence[Any], settings: dict[str,
     return TokenCounts(runtime_key.model_id, counts, max_tokens, load_ms)
 
 
+# Tokenizers of models that are not loaded, for rejecting over-limit texts without loading the model
+# (CPU only, a few MB each). Least recently used first; model ids are client-controlled, so the cache is bounded.
+_STANDALONE_TOKENIZERS_MAX = 4
+_standalone_tokenizers: OrderedDict[tuple[str, str], Any] = OrderedDict()
+_standalone_tokenizer_lock = threading.Lock()
+
+
+def _load_standalone_tokenizer(model_id: str, cache_folder: str) -> Any:
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model_id, cache_dir=cache_folder or None, token=_resolve_token())
+
+
+def _standalone_tokenizer(model_id: str, settings: dict[str, Any]) -> Any:
+    """The model's tokenizer without its weights; call with _standalone_tokenizer_lock held. None if unavailable."""
+    key = (model_id, resolve_model_cache_path(settings.get("model_cache_path", "")))
+    if key in _standalone_tokenizers:
+        _standalone_tokenizers.move_to_end(key)
+        return _standalone_tokenizers[key]
+    try:
+        tokenizer = _load_standalone_tokenizer(*key)
+    except Exception as exc:
+        print(f"[G3_EMBED] Tokenizer for '{model_id}' unavailable, its token check loads the model: {exc}", flush=True)
+        tokenizer = None
+    tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    _standalone_tokenizers[key] = tokenizer
+    while len(_standalone_tokenizers) > _STANDALONE_TOKENIZERS_MAX:
+        _standalone_tokenizers.popitem(last=False)
+    return tokenizer
+
+
+def reject_too_long_before_load(model_id: str, texts: Sequence[str], settings: dict[str, Any] | None = None) -> None:
+    """Raise InputTooLongError, counted with the tokenizer alone (CPU), while the model is not loaded.
+
+    Without this, a request that is rejected anyway first loads (and compiles) its model onto the GPU. Only
+    for models whose catalog entry has the native window (max_seq_length), so window, counts and error match
+    what count_input_tokens reports after loading. Returns when the model is loaded, the window is unknown,
+    the tokenizer is unavailable or every text fits; the caller then counts as before (loading the model).
+    """
+    runtime_key, _, settings_snapshot = build_runtime_key(model_id, settings)
+    if runtime_key in _model_cache or not texts:
+        return
+    native = int(get_model_spec(runtime_key.model_id).get("max_seq_length") or 0)
+    max_tokens = _effective_max_seq_length(runtime_key.model_id, settings_snapshot, native) if native > 0 else None
+    if not max_tokens:
+        return
+    with _standalone_tokenizer_lock:
+        tokenizer = _standalone_tokenizer(runtime_key.model_id, settings_snapshot)
+        if tokenizer is None:
+            return
+        token_ids = tokenizer(
+            [str(text or "") for text in texts], add_special_tokens=True, truncation=False, verbose=False
+        )["input_ids"]
+    too_long = [{"index": index, "tokens": len(ids)} for index, ids in enumerate(token_ids) if len(ids) > max_tokens]
+    if too_long:
+        raise InputTooLongError(runtime_key.model_id, max_tokens, too_long)
+
+
 def validate_input_lengths(model_id: str, texts: list[str], settings: dict[str, Any] | None = None) -> float:
     """Raise InputTooLongError for texts longer than the effective window (prompt and special tokens included).
 
-    Loads the model if needed and returns the load time in ms. Call it before batching so one oversized
-    text only fails its own request.
+    Loads the model if needed (not when the tokenizer alone already rejects a text) and returns the load
+    time in ms. Call it before batching so one oversized text only fails its own request.
     """
+    reject_too_long_before_load(model_id, texts, settings)
     result = count_input_tokens(model_id, texts, settings)
     if not result.max_tokens:
         return result.load_duration_ms

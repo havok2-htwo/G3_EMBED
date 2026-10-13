@@ -101,6 +101,7 @@ def isolated_state(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "authorize_api_key", lambda request: None)
     monkeypatch.setattr(api, "media_slots", api._MediaSlots())
     monkeypatch.setattr(runtime, "_model_cache", {})
+    monkeypatch.setattr(runtime, "_standalone_tokenizers", runtime.OrderedDict())
     saved = dict(current_settings)
     current_settings.clear()
     current_settings.update(storage.normalize_settings({}))
@@ -148,6 +149,14 @@ def fake_model(monkeypatch):
         return model, 0.0
 
     monkeypatch.setattr(runtime, "_load_model", load)
+    # Tokenizer-only token checks (models not loaded yet) count with the same fake tokenizer.
+    model.tokenizer_loads = []
+
+    def load_tokenizer(model_id, cache_folder):
+        model.tokenizer_loads.append(model_id)
+        return FakeTokenizer()
+
+    monkeypatch.setattr(runtime, "_load_standalone_tokenizer", load_tokenizer)
     return model
 
 

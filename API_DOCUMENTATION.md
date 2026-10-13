@@ -96,7 +96,7 @@ Response:
 
 #### Texts over the token limit
 
-By default (`too_long_policy: reject`), a request is rejected when any input, counted with its prompt and special tokens, exceeds the model's token limit (`max_seq_length`, e.g. 4096 for EmbeddingGemma 2, 512 for E5). Nothing is embedded; only that request fails.
+By default (`too_long_policy: reject`), a request is rejected when any input, counted with its prompt and special tokens, exceeds the model's token limit (`max_seq_length`, e.g. 4096 for EmbeddingGemma 2, 512 for E5). Nothing is embedded; only that request fails. A model that is not loaded yet is not loaded for a request whose texts its tokenizer already finds too long (catalog models with a known token window).
 
 ```json
 HTTP 400

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Texts over the token limit for a model that is not loaded are rejected by its tokenizer alone (CPU, cached for up to 4 models) instead of loading the model onto the GPU first. Same HTTP 400 `input_too_long` response as before. Clients sending over-limit texts for `intfloat/multilingual-e5-large` had kept it loaded (and compiled) next to the default model, ~2.4 GB of VRAM. Requests that fit still load the model as before. Applies to catalog models with a known native window; the catalog now lists it for E5, BGE M3, MiniLM and Qwen3, so `/v1/models` also reports their `max_model_len` before loading.
 - Text forward passes are packed by padded tokens (`encode_token_batching`, default on): budget `encode_batch_size` x token window, at most 128 texts per pass, so short texts share passes while full-window texts keep the old peak VRAM. EmbeddingGemma 2 (`full` compile, RTX 4090): 512 short texts 3.0 s -> 0.16 s, 256 x 1k chars 1.5 s -> 0.26 s.
 - CUDA graphs for short EmbeddingGemma 2 text passes (`cuda_graphs`, default on; up to 512 tokens x 128 texts, a few MB of extra VRAM with `full` compile, captured at model load, normal forward for everything else): a single query 16 -> 4.3 ms warm (32-52 ms before this release). Capture adds 1.5-2.5 min to a `full`-compile load (~9 s without compile).
 - Media requests on CUDA no longer run `gc.collect()` after a successful pass (only `empty_cache()`); it cost 0.3-1 s per request in a compiled process (1 image 419 -> 80 ms). Failures and OOM still collect.
