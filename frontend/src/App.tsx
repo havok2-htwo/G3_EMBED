@@ -73,11 +73,13 @@ const emptySettings: AdminSettings = {
   batch_max_texts: 32,
   batch_max_chars: 64000,
   encode_batch_size: 0,
+  encode_token_batching: true,
   max_seq_length: 0,
   too_long_policy: "reject",
   precision: "auto",
   quantization: "none",
   compile_mode: "off",
+  cuda_graphs: true,
   warmup_on_load: false,
   huggingface_token: "",
   image_inputs_enabled: true,
@@ -985,6 +987,14 @@ export default function App() {
             <label className="switch-row">
               <input type="checkbox" checked={settingsForm.warmup_on_load} onChange={(event) => updateSetting("warmup_on_load", event.target.checked)} />
               <span>Warm up on load</span>
+            </label>
+            <label className="switch-row">
+              <input type="checkbox" checked={settingsForm.encode_token_batching} onChange={(event) => updateSetting("encode_token_batching", event.target.checked)} />
+              <span>Pack texts by tokens</span>
+            </label>
+            <label className="switch-row">
+              <input type="checkbox" checked={settingsForm.cuda_graphs} onChange={(event) => updateSetting("cuda_graphs", event.target.checked)} />
+              <span>CUDA graphs (EmbeddingGemma 2)</span>
             </label>
             <span className="eyebrow full-width">Media limits (image / audio / video)</span>
             <div className="button-row full-width">

@@ -68,11 +68,63 @@ def test_encode_inputs_releases_cache_after_cuda_media(fake_model, monkeypatch):
     released = []
     monkeypatch.setattr(runtime, "_is_cuda_pytorch", lambda choice: True)
     monkeypatch.setattr(runtime, "_check_cuda_headroom", lambda required_mb, device: None)
-    monkeypatch.setattr(runtime, "_release_cuda_cache", lambda: released.append(True))
+    monkeypatch.setattr(runtime, "_release_cuda_cache", lambda: released.append("gc"))
+    monkeypatch.setattr(runtime, "_empty_cuda_cache", lambda: released.append("empty"))
     runtime.encode_inputs(GEMMA, [image_input()], None, [300])
-    assert released == [True]
+    # A successful pass skips gc.collect() (~0.3-1 s with torch.compile state) and only empties the cache.
+    assert released == ["empty"]
     runtime.encode_inputs(GEMMA, ["text only"], None, [3])
-    assert released == [True]  # text-only calls keep the cache
+    assert released == ["empty"]  # text-only calls keep the cache
+
+
+# --- token-budget batching ----------------------------------------------------------------------------------
+
+def test_plan_token_batches_packs_by_padded_tokens():
+    lengths = [10, 4096, 12, 4000, 8, 11]
+    batches = runtime.plan_token_batches(lengths, token_budget=8192, max_rows=3)
+    # Longest first; each pass is padded to its first entry: 2 x 4096 <= 8192, then 3 rows (cap) of <= 12.
+    assert batches == [[1, 3], [2, 5, 0], [4]]
+    assert sorted(index for batch in batches for index in batch) == list(range(len(lengths)))
+    for batch in batches:
+        assert len(batch) * max(lengths[index] for index in batch) <= 8192
+
+
+def test_plan_token_batches_oversized_entry_gets_own_pass():
+    assert runtime.plan_token_batches([9000, 5, 0], token_budget=4096, max_rows=128) == [[0], [1, 2]]
+    assert runtime.plan_token_batches([], token_budget=4096) == []
+
+
+def test_encode_texts_packs_short_texts_into_one_pass(fake_model):
+    texts = [" ".join(["w"] * (index % 7 + 1)) for index in range(40)]
+    result = runtime.encode_texts(GEMMA, texts)
+    # Default EmbeddingGemma 2 budget: 4 x 4096 tokens, so 40 short texts share one pass instead of 10 passes of 4.
+    assert [call["batch_size"] for call in fake_model.calls] == [40]
+    assert [row[0] for row in result.vectors] == [float(len(text)) for text in texts]
+
+
+def test_encode_texts_token_budget_follows_batch_size_and_window(fake_model, settings):
+    settings(encode_batch_size=2, max_seq_length=8)
+    texts = ["a b c d e f", "a", "a b", "a b c d e f g h i j", "a b c"]  # tokens incl. <bos>/<eos>: 8 3 4 12 5
+    result = runtime.encode_texts(GEMMA, texts)
+    # Budget 2 x 8 = 16 padded tokens; lengths are capped at the window (12 -> 8, a tie kept in input order).
+    assert [[item["text"] for item in call["inputs"]] for call in fake_model.calls] == [
+        ["a b c d e f", "a b c d e f g h i j"],
+        ["a b c", "a b", "a"],
+    ]
+    assert [row[0] for row in result.vectors] == [float(len(text)) for text in texts]
+
+
+def test_encode_texts_token_batching_can_be_disabled(fake_model, settings):
+    settings(encode_token_batching=False)
+    runtime.encode_texts(GEMMA, ["x"] * 10)
+    assert [call["batch_size"] for call in fake_model.calls] == [4]  # one encode call, fixed batch size
+
+
+def test_encode_inputs_text_part_uses_token_batching(fake_model):
+    texts = ["word"] * 9
+    result = runtime.encode_inputs(GEMMA, texts + [image_input()], None, [3] * 9 + [300])
+    assert [call["batch_size"] for call in fake_model.calls] == [9, 1]
+    assert [row[0] for row in result.vectors] == [4.0] * 9 + [1000.0]
 
 
 def test_encode_inputs_headroom_checked_per_chunk(fake_model, monkeypatch, settings):

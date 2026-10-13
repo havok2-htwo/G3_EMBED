@@ -13,11 +13,13 @@ export type AdminSettings = {
   batch_max_texts: number;
   batch_max_chars: number;
   encode_batch_size: number;
+  encode_token_batching: boolean;
   max_seq_length: number;
   too_long_policy: string;
   precision: string;
   quantization: string;
   compile_mode: string;
+  cuda_graphs: boolean;
   warmup_on_load: boolean;
   huggingface_token: string;
   // Media inputs (image / audio / video); the backend clamps every limit to its hard range.

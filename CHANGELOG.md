@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Text forward passes are packed by padded tokens (`encode_token_batching`, default on): budget `encode_batch_size` x token window, at most 128 texts per pass, so short texts share passes while full-window texts keep the old peak VRAM. EmbeddingGemma 2 (`full` compile, RTX 4090): 512 short texts 3.0 s -> 0.16 s, 256 x 1k chars 1.5 s -> 0.26 s.
+- CUDA graphs for short EmbeddingGemma 2 text passes (`cuda_graphs`, default on; up to 512 tokens x 128 texts, a few MB of extra VRAM with `full` compile, captured at model load, normal forward for everything else): a single query 16 -> 4.3 ms warm (32-52 ms before this release). Capture adds 1.5-2.5 min to a `full`-compile load (~9 s without compile).
+- Media requests on CUDA no longer run `gc.collect()` after a successful pass (only `empty_cache()`); it cost 0.3-1 s per request in a compiled process (1 image 419 -> 80 ms). Failures and OOM still collect.
+- sentence-transformers' per-call `model.to(device)` / `model.eval()` return early when nothing changes (~11 ms per call with EmbeddingGemma 2).
+
 - SECURITY: strings sent to `/embed`, `/v1/embeddings` and the admin compare/benchmark routes that looked like media URLs, file paths or data URIs were fetched or read as media by sentence-transformers (SSRF and local file read with EmbeddingGemma 2). Text is now always passed as `{"text": ...}` and embedded as text; embeddings of normal text are unchanged.
 - `/embed` and `/v1/embeddings` accept image, audio and video inputs for `google/embeddinggemma-2` (PyTorch backend only): objects `{"text", "image", "audio", "video"}` with base64 or data-URI payloads, one embedding per object, mixable with plain strings. Video is a list of pre-sampled frames (no video file decoding). Prompts apply to the text part only.
 - Media limits as admin settings with hard caps: per-modality switches, images per input/request, audio clips and seconds, videos and frames, item size, image megapixels, `media_pass_budget_mb` and `max_concurrent_media_requests`. Listed under `media` in `/health`.

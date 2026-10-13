@@ -105,7 +105,8 @@ Image, audio and video inputs are objects in the same list (see [Image, Audio an
 
 - `too_long_policy` ("Texts Over Token Limit"): `reject` (default) answers HTTP 400 `input_too_long` when any text, including its prompt and special tokens, exceeds the token limit; `truncate` cuts it silently. Requests can override this with `"truncate": true/false`. Oversized texts are rejected before batching, so they never fail other clients' requests.
 - `max_seq_length` ("Max Tokens / Text"): token limit per text. `0` uses the model default (EmbeddingGemma 2 and Qwen3: 4096, others: their native limit). Values above a model's limit are clamped (E5: 512, EmbeddingGemma 2: 8192).
-- `encode_batch_size` ("GPU Batch Size"): texts per forward pass. `0` uses the model default (EmbeddingGemma 2: 4, Qwen3: 2, others: `batch_max_texts`). `batch_max_texts` / `batch_max_chars` only control how queued requests are merged.
+- `encode_batch_size` ("GPU Batch Size"): texts per forward pass at the full token window. `0` uses the model default (EmbeddingGemma 2: 4, Qwen3: 2, others: `batch_max_texts`). `batch_max_texts` / `batch_max_chars` only control how queued requests are merged.
+- `encode_token_batching` ("Pack texts by tokens", default on): forward passes are packed by padded tokens instead of a fixed text count. The budget is `encode_batch_size` x token window (EmbeddingGemma 2: 4 x 4096 = 16384 tokens), at most 128 texts per pass, longest texts first. Full-window texts still run 4 per pass, so peak VRAM stays at the old worst case, while short texts share one pass. Measured with EmbeddingGemma 2, `full` compile, RTX 4090: 512 texts of ~190 chars 3.0 s -> 0.16 s, 256 x 1k chars 1.5 s -> 0.26 s, 48 mixed 265 -> 106 ms (see the table under [CUDA graphs](#cuda-graphs)). Embeddings differ from fixed batches only by bf16 padding noise (cosine >= 0.9997). Off restores the fixed `encode_batch_size`.
 - `quantization`: `none`, `int8` or `nf4` via bitsandbytes. Applied only to Qwen3 models on PyTorch CUDA; ignored for other models.
 
 Measured on an RTX 4090 (peak PyTorch allocation; add ~0.5 GB CUDA context). Retrieval quality is nDCG@10 on GermanQuAD (short Wikipedia passages) and a 1000-document GerDaLIR subset (German court decisions, ~3300 tokens), with query/document prompts:
@@ -234,7 +235,7 @@ How a media request runs:
 - A single input whose own estimate exceeds the budget is rejected with HTTP 400 `media_limit_exceeded` (`limit: media_pass_budget_mb`). With the defaults the largest possible input is estimated at about 845 MB.
 - Before each media pass on CUDA, free memory (plus cached but unused memory) must cover the estimate plus a 256 MB margin; otherwise the pass is not attempted and the request returns HTTP 503 `gpu_memory_unavailable`.
 - A CUDA out-of-memory error (media or text; also `CUDA error: out of memory` and cuBLAS/cuDNN allocation failures) releases the CUDA cache and returns HTTP 503 `gpu_out_of_memory`.
-- After every request that ran media on CUDA, the CUDA cache is released so reserved memory goes back to the other services. When a pass fails, the cache is released only after the failed pass's tensors are freed, so its memory is returned too.
+- After every request that ran media on CUDA, the CUDA cache is released (`torch.cuda.empty_cache()`) so reserved memory goes back to the other services. A successful pass skips `gc.collect()`: its tensors are already freed, and a full collection in a process holding `torch.compile` state took 0.3-1 s per request (1 image 419 -> 80-113 ms, 30 s audio 448 -> 98-116 ms). When a pass fails, `gc.collect()` runs and the cache is released only after the failed pass's tensors are freed, so its memory is returned too.
 - All passes share the per-model encode lock, so only one forward pass runs at a time.
 
 The budget covers media passes only. Text keeps `encode_batch_size` (EmbeddingGemma 2 default 4: about 1.9 GB above the loaded model at 4 x 4096 tokens, see the last row).
@@ -259,6 +260,32 @@ For multimodal models (EmbeddingGemma 2), `full` compiles only the language mode
 Compilation uses `dynamic=True`, so varying text lengths and batch sizes do not trigger recompiles, and it runs as a warmup while the model loads (covering short/long and padded/unpadded batches), not on the first request. A rare remaining input variant may still compile once on first use. Graphs that fail to compile fall back to eager.
 
 At server start the default model is preloaded in the background when it is already downloaded, so a long `full` warmup does not land on the first request. `/health` stays responsive meanwhile; embedding requests wait until the model is ready. Compile is skipped for bitsandbytes-quantized models and when Triton is missing.
+
+## CUDA graphs
+
+`cuda_graphs` (default on; EmbeddingGemma 2 on PyTorch CUDA in bf16/fp16 only, other models ignore it): short text passes replay captured CUDA graphs instead of launching each kernel from Python. A short query is launch-bound on Windows: about 1.8 ms of GPU work but 15-30 ms of CPU time launching kernels.
+
+- Buckets: up to 512 tokens (the sliding window) x 1-128 texts, at most 4096 padded tokens per graph, 38 graphs. Inputs are padded to the next bucket with padded keys masked out; only the real rows and tokens are returned. Longer passes, media and anything else run the normal (compiled) forward.
+- Captured once at model load (largest bucket first, one shared memory pool; a few MB above the compiled model's own reserve, budget 1 GB). With `compile_mode=full` the capture adds about 1.5-2.5 minutes to the load (the graph input path is compiled once more); without compile it takes about 9 s. A failed capture logs a line and the model runs without graphs.
+- Outputs match the normal forward up to bf16 padding noise (cosine >= 0.9999).
+
+Warm `encode_texts` latency, EmbeddingGemma 2, `compile_mode=full`, RTX 4090 (before = fixed batch 4 with `gc.collect()` after media; the middle column is token batching and the `to()`/`eval()` fast path without graphs):
+
+| Workload | before | without graphs | with graphs |
+|---|---|---|---|
+| 1 query (70 chars) | 32-52 ms | 16 ms | 4.3 ms |
+| 3 texts x 300 chars | 32 ms | 19 ms | 4.6 ms |
+| 4 texts x 1k chars | 41 ms | 23 ms | 11 ms |
+| 8 texts x 2k chars | 65 ms | 29 ms | 23 ms |
+| 2 texts x 4096 tokens | 66 ms | 54 ms | 55 ms |
+| 48 mixed texts | 265 ms | 106 ms | 115 ms |
+| 512 texts x 190 chars | 3025 ms | 159 ms | 178 ms |
+| 1 image | 419 ms | | 80 ms |
+| 30 s audio | 448 ms | | 116 ms |
+
+- `/health` and `/api/admin/system` list `cuda_graphs` per loaded model (graphs, memory, replays, fallbacks).
+
+sentence-transformers calls `model.to(device)` and `model.eval()` on every `encode()`; each walks all ~1500 modules of EmbeddingGemma 2 (~11 ms on a Ryzen 5900X). Both return early now when nothing would change.
 
 Triton: Linux CUDA builds of PyTorch include it. On Windows, `tools/install_torch_backend.py` installs the `triton-windows` release that matches the installed torch minor version (torch 2.11 -> triton 3.7). Set `GENESIS_SKIP_TRITON_WINDOWS=1` to skip it.
 

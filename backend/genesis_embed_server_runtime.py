@@ -32,6 +32,9 @@ from .genesis_embed_server_media import (
 
 # Free memory (beyond the pass estimate) a media pass must leave for the other services on the GPU.
 CUDA_MEDIA_MARGIN_MB = 256
+# Most texts per forward pass when packing by tokens. Short texts are overhead-bound (EmbeddingGemma 2 on an
+# RTX 4090: ~25 ms per pass whether it holds 4 or 64 short texts); beyond 128 the gain is small.
+TOKEN_BATCH_MAX_ROWS = 128
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,7 @@ class RuntimeKey:
     precision: str
     compile_mode: str
     quantization: str = "none"
+    cuda_graphs: bool = False
 
 
 @dataclass
@@ -277,6 +281,64 @@ def _warmup_compiled_model(model: Any, max_seq_length: int | None, encode_batch_
     print(f"[G3_EMBED] torch.compile warmup finished in {time.perf_counter() - started:.1f} s", flush=True)
 
 
+def _skip_redundant_to_and_eval(model: Any) -> None:
+    """Make sentence-transformers' per-call model.to(device) and model.eval() return early.
+
+    encode() calls both on every call and each walks every module (~1500 with the vision/audio towers of
+    EmbeddingGemma 2): ~11 ms per call on a Ryzen 5900X, a third of a short request. Models are never moved
+    or trained after loading, so a same-device to() and eval() of an eval-mode model are no-ops.
+    """
+    import torch
+
+    original_to = model.to
+    original_eval = model.eval
+
+    def to(*args: Any, **kwargs: Any) -> Any:
+        if len(args) == 1 and not kwargs and isinstance(args[0], (str, torch.device)):
+            try:
+                if torch.device(args[0]) == model.device:
+                    return model
+            except Exception:
+                pass
+        return original_to(*args, **kwargs)
+
+    def eval_() -> Any:
+        if not model.training:
+            return model
+        return original_eval()
+
+    model.to = to
+    model.eval = eval_
+
+
+def _install_cuda_graphs(model: Any) -> Any:
+    """Capture CUDA graphs for short text passes (EmbeddingGemma 2 on CUDA); returns the runner or None."""
+    from . import genesis_embed_server_cuda_graphs as cuda_graphs
+
+    first_module = model._first_module()
+    inner_model = getattr(first_module, "model", None)
+    ok, reason = cuda_graphs.supported(inner_model)
+    if not ok:
+        print(f"[G3_EMBED] CUDA graphs skipped: {reason}", flush=True)
+        return None
+    runner = cuda_graphs.TextGraphRunner(inner_model)
+    try:
+        runner.capture()
+    except Exception as exc:
+        print(f"[G3_EMBED] CUDA graphs disabled, capture failed: {exc}", flush=True)
+        runner.graphs.clear()
+        _release_cuda_cache()
+        return None
+    runner.install()
+    status = runner.status()
+    print(
+        f"[G3_EMBED] CUDA graphs: {status['graphs']} text buckets captured in {status['capture_ms'] / 1000:.1f} s, "
+        f"{status['memory_mb']:.0f} MB",
+        flush=True,
+    )
+    return runner
+
+
 def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: RuntimeChoice) -> tuple[Any, float]:
     global _last_runtime_error
 
@@ -320,6 +382,9 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
             # Quantized loading stages full-precision shards on the GPU; release that cache.
             _release_cuda_cache()
 
+        if choice.backend == "pytorch":
+            _skip_redundant_to_and_eval(model)
+
         if compiled:
             _warmup_compiled_model(
                 model,
@@ -328,6 +393,7 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
             )
         elif settings.get("warmup_on_load"):
             model.encode(_wrap_texts(["warmup"]), normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
+        graph_runner = _install_cuda_graphs(model) if runtime_key.cuda_graphs else None
 
         load_ms = (time.perf_counter() - load_started) * 1000
         _model_cache[runtime_key] = {
@@ -338,6 +404,7 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
             "native_max_seq_length": native_max_seq_length,
             "encode_lock": threading.Lock(),
             "count_lock": threading.Lock(),
+            "cuda_graphs": graph_runner,
         }
         _last_runtime_error = None
         print(
@@ -352,6 +419,15 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
 
 def _release_cuda_cache() -> None:
     gc.collect()
+    _empty_cuda_cache()
+
+
+def _empty_cuda_cache() -> None:
+    """Return unused cached blocks to the driver, without gc.collect().
+
+    After a successful pass its tensors are already freed by reference counting. A full gc.collect() in a
+    process holding torch.compile state takes ~0.3-1 s, so it is reserved for failures and unloads.
+    """
     try:
         import torch
 
@@ -407,6 +483,29 @@ def _effective_encode_batch_size(model_id: str, settings: dict[str, Any], text_c
     return max(1, min(configured, text_count))
 
 
+def _encode_token_budget(model_id: str, settings: dict[str, Any], max_seq_length: int | None) -> int:
+    """Padded tokens per forward pass: encode_batch_size sequences at the full window (the old worst case)."""
+    window = int(max_seq_length or 0) or MAX_SEQ_LENGTH_LIMIT
+    return _effective_encode_batch_size(model_id, settings, 1 << 30) * window
+
+
+def plan_token_batches(lengths: Sequence[int], token_budget: int, max_rows: int = TOKEN_BATCH_MAX_ROWS) -> list[list[int]]:
+    """Group input indices into forward passes of at most token_budget padded tokens (rows x longest).
+
+    Longest first, so each pass is padded to its first entry and similar lengths share a pass: short texts
+    go in passes of up to max_rows, full-window texts stay at token_budget // window.
+    """
+    order = sorted(range(len(lengths)), key=lambda index: -int(lengths[index]))
+    batches: list[list[int]] = []
+    start = 0
+    while start < len(order):
+        longest = max(1, int(lengths[order[start]]))
+        rows = max(1, min(max_rows, token_budget // longest))
+        batches.append(order[start : start + rows])
+        start += rows
+    return batches
+
+
 def build_runtime_key(model_id: str, settings: dict[str, Any] | None = None) -> tuple[RuntimeKey, RuntimeChoice, dict[str, Any]]:
     with settings_lock:
         settings_snapshot = dict(current_settings)
@@ -421,6 +520,11 @@ def build_runtime_key(model_id: str, settings: dict[str, Any] | None = None) -> 
     quantization = str(settings_snapshot.get("quantization") or "none")
     if not _is_cuda_pytorch(choice) or not get_model_spec(normalized_model_id).get("quantizable"):
         quantization = "none"
+    cuda_graphs = bool(
+        settings_snapshot.get("cuda_graphs", True)
+        and _is_cuda_pytorch(choice)
+        and get_model_spec(normalized_model_id).get("cuda_graphs")
+    )
     return (
         RuntimeKey(
             model_id=normalized_model_id,
@@ -429,6 +533,7 @@ def build_runtime_key(model_id: str, settings: dict[str, Any] | None = None) -> 
             precision=str(settings_snapshot.get("precision") or "auto"),
             compile_mode=str(settings_snapshot.get("compile_mode") or "off"),
             quantization=quantization,
+            cuda_graphs=cuda_graphs,
         ),
         choice,
         settings_snapshot,
@@ -524,6 +629,67 @@ def resolve_backend(model_id: str, settings: dict[str, Any] | None = None) -> st
     return choice.backend
 
 
+def _count_tokenizer(cache_entry: dict[str, Any], tokenizer: Any) -> Any:
+    """Private tokenizer copy for counting; call with cache_entry["count_lock"] held.
+
+    The shared (Rust-backed) tokenizer is mutated with truncation settings by a concurrent model.encode and
+    must not be called with different settings outside encode_lock.
+    """
+    count_tokenizer = cache_entry.get("count_tokenizer")
+    if count_tokenizer is None:
+        count_tokenizer = copy.deepcopy(tokenizer)
+        cache_entry["count_tokenizer"] = count_tokenizer
+    return count_tokenizer
+
+
+def _encode_text_rows(
+    model: Any,
+    model_id: str,
+    settings: dict[str, Any],
+    cache_entry: dict[str, Any],
+    texts: list[str],
+    max_seq_length: int | None,
+) -> np.ndarray:
+    """Normalized embeddings of texts in input order; call with encode_lock held.
+
+    With encode_token_batching (default) passes are packed by padded tokens (plan_token_batches) instead of a
+    fixed encode_batch_size texts, so many short texts share one pass while VRAM stays bounded by the old
+    worst case (encode_batch_size full-window sequences).
+    """
+    batch_size = _effective_encode_batch_size(model_id, settings, len(texts))
+    tokenizer = getattr(model, "tokenizer", None)
+    tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    if not settings.get("encode_token_batching", True) or len(texts) <= batch_size or tokenizer is None:
+        return _as_rows(
+            model.encode(
+                _wrap_texts(texts),
+                batch_size=batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+        )
+    with cache_entry["count_lock"]:
+        token_ids = _count_tokenizer(cache_entry, tokenizer)(
+            texts, add_special_tokens=True, truncation=False, verbose=False
+        )["input_ids"]
+    limit = int(max_seq_length or 0) or MAX_SEQ_LENGTH_LIMIT
+    lengths = [min(len(ids), limit) for ids in token_ids]
+    rows: list[Any] = [None] * len(texts)
+    for batch in plan_token_batches(lengths, _encode_token_budget(model_id, settings, max_seq_length)):
+        # batch_size = pass size, so sentence-transformers runs exactly this pass.
+        vectors = model.encode(
+            _wrap_texts([texts[index] for index in batch]),
+            batch_size=len(batch),
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        for index, row in zip(batch, _as_rows(vectors)):
+            rows[index] = row
+    return np.stack(rows)
+
+
 def count_input_tokens(model_id: str, inputs: Sequence[Any], settings: dict[str, Any] | None = None) -> TokenCounts:
     """Sequence length per input (prompt, special and media tokens included), untruncated.
 
@@ -535,13 +701,8 @@ def count_input_tokens(model_id: str, inputs: Sequence[Any], settings: dict[str,
         return TokenCounts(runtime_key.model_id, [], max_tokens, load_ms)
     texts = [str(item or "") for item in inputs if not isinstance(item, DecodedMedia)]
     media_texts = [item.text or "" for item in inputs if isinstance(item, DecodedMedia)]
-    # A private copy: the shared (Rust-backed) tokenizer is mutated with truncation settings by a concurrent
-    # model.encode and must not be called with different settings outside encode_lock.
     with cache_entry["count_lock"]:
-        count_tokenizer = cache_entry.get("count_tokenizer")
-        if count_tokenizer is None:
-            count_tokenizer = copy.deepcopy(tokenizer)
-            cache_entry["count_tokenizer"] = count_tokenizer
+        count_tokenizer = _count_tokenizer(cache_entry, tokenizer)
         text_ids = (
             count_tokenizer(texts, add_special_tokens=True, truncation=False, verbose=False)["input_ids"] if texts else []
         )
@@ -593,12 +754,8 @@ def encode_texts(model_id: str, texts: list[str], settings: dict[str, Any] | Non
             model.max_seq_length = max_seq_length
         encode_started = time.perf_counter()
         try:
-            vectors_np = model.encode(
-                _wrap_texts(normalized_texts),
-                batch_size=_effective_encode_batch_size(runtime_key.model_id, settings_snapshot, len(normalized_texts)),
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
+            vectors_np = _encode_text_rows(
+                model, runtime_key.model_id, settings_snapshot, cache_entry, normalized_texts, max_seq_length
             )
         except Exception as exc:
             if not _is_cuda_oom(exc):
@@ -664,14 +821,10 @@ def encode_inputs(
         try:
             if text_positions:
                 texts = [str(inputs[index] or "") for index in text_positions]
-                vectors = model.encode(
-                    _wrap_texts(texts),
-                    batch_size=_effective_encode_batch_size(runtime_key.model_id, settings_snapshot, len(texts)),
-                    normalize_embeddings=True,
-                    convert_to_numpy=True,
-                    show_progress_bar=False,
+                vectors = _encode_text_rows(
+                    model, runtime_key.model_id, settings_snapshot, cache_entry, texts, max_seq_length
                 )
-                for index, row in zip(text_positions, _as_rows(vectors)):
+                for index, row in zip(text_positions, vectors):
                     rows[index] = row
             for chunk in chunks:
                 positions = [media_positions[offset] for offset in chunk]
@@ -691,11 +844,13 @@ def encode_inputs(
             failure = exc
         # Outside the except block: while an exception propagates, its traceback pins the failed pass's tensors.
         out_of_memory = failure is not None and _is_cuda_oom(failure)
-        if out_of_memory or (on_cuda and media_positions):
-            if failure is not None:
-                _drop_tracebacks(failure)
+        if failure is not None and (out_of_memory or (on_cuda and media_positions)):
+            _drop_tracebacks(failure)
             # Hand reserved memory back to the other services sharing the GPU.
             _release_cuda_cache()
+        elif on_cuda and media_positions:
+            # Success: the pass's tensors are already freed; skip the slow gc.collect().
+            _empty_cuda_cache()
         if out_of_memory:
             raise GpuOutOfMemory(runtime_key.model_id)
         if failure is not None:
@@ -753,6 +908,7 @@ def get_runtime_status() -> dict[str, Any]:
             "precision": key.precision,
             "compile_mode": key.compile_mode,
             "quantization": key.quantization,
+            "cuda_graphs": value["cuda_graphs"].status() if value.get("cuda_graphs") is not None else None,
             "max_seq_length": getattr(value.get("model"), "max_seq_length", None),
             "loaded_at": value.get("loaded_at"),
             "load_duration_ms": value.get("load_duration_ms"),

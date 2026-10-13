@@ -29,6 +29,8 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "max_seq_length": 8192,
         "default_max_seq_length": 4096,
         "default_encode_batch_size": 4,
+        # Short text passes replay captured CUDA graphs (setting cuda_graphs).
+        "cuda_graphs": True,
         "query_prompt": "task: search result | query: ",
         "document_prompt": "title: none | text: ",
         "notes": "Default. Multilingual, 8k context, 768 dims. ~1.9 GB VRAM at 4096 tokens, batch 1; ~3.3 GB at batch 4.",

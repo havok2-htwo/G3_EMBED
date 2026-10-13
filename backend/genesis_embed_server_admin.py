@@ -47,11 +47,13 @@ class AdminSettingsPayload(BaseModel):
     batch_max_texts: int
     batch_max_chars: int
     encode_batch_size: int = 0
+    encode_token_batching: bool = True
     max_seq_length: int = 0
     too_long_policy: str = "reject"
     precision: str
     quantization: str = "none"
     compile_mode: str
+    cuda_graphs: bool = True
     warmup_on_load: bool
     huggingface_token: str
     # Optional so older frontends keep working; an omitted field keeps its current value (see PUT below).
