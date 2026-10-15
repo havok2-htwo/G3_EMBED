@@ -21,4 +21,7 @@ fi
 # Admin access is username/password (default admin/admin, change forced on first login).
 echo "Nutze lokale venv unter \"$VENV_DIR\" ..."
 echo "Starte G3_EMBED auf http://127.0.0.1:8777 ..."
+# numpy/scipy's OpenBLAS starts one thread per core at import, each with a never-used 32 MB buffer;
+# torch has its own thread pool, so 4 BLAS threads cost no speed.
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}"
 "$VENV_PYTHON" -m backend.genesis_embed_server

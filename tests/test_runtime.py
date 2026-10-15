@@ -268,3 +268,38 @@ def test_full_compile_text_model_unchanged(compile_env):
 
 def test_as_rows_reshapes_single_vector():
     assert runtime._as_rows(np.zeros(4)).shape == (1, 4)
+
+
+def test_token_counting_uses_the_model_tokenizer_under_the_tokenizer_lock(fake_model, monkeypatch):
+    """No private tokenizer copy: counts come from the shared tokenizer, serialized with encode()'s preprocess."""
+    held = []
+    original_call = type(fake_model.tokenizer).__call__
+
+    def call(self, *args, **kwargs):
+        lock = next(iter(runtime._model_cache.values()))["tokenizer_lock"]
+        held.append(lock._is_owned())
+        return original_call(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(fake_model.tokenizer), "__call__", call)
+    counts = runtime.count_input_tokens(GEMMA, ["a b c", "d"])
+    assert counts.counts == [5, 3]
+    assert held == [True]
+    assert all(not key.startswith("count_") for key in next(iter(runtime._model_cache.values())))
+
+
+def test_serialize_preprocess_holds_the_lock_during_tokenization():
+    import threading
+
+    lock = threading.RLock()
+    seen = []
+
+    class Model:
+        def preprocess(self, inputs, prompt=None):
+            seen.append((lock._is_owned(), inputs, prompt))
+            return {"input_ids": inputs}
+
+    model = Model()
+    runtime._serialize_preprocess(model, lock)
+    assert model.preprocess(["x"], prompt="p") == {"input_ids": ["x"]}
+    assert seen == [(True, ["x"], "p")]
+    assert not lock._is_owned()

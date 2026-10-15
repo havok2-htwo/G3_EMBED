@@ -12,10 +12,12 @@ RUN npm run build
 
 # ---- Stage 2: python runtime ----
 FROM python:3.12-slim-bookworm AS runtime
+# OPENBLAS_NUM_THREADS: numpy/scipy's OpenBLAS would start one thread per core, each with a never-used 32 MB buffer.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    HF_HOME=/app/models/.hf
+    HF_HOME=/app/models/.hf \
+    OPENBLAS_NUM_THREADS=4
 
 # libgomp1: OpenMP runtime needed by torch/openvino CPU wheels. curl: healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import gc
 import logging
 import math
@@ -385,6 +384,8 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
 
         if choice.backend == "pytorch":
             _skip_redundant_to_and_eval(model)
+        tokenizer_lock = threading.RLock()
+        _serialize_preprocess(model, tokenizer_lock)
 
         if compiled:
             _warmup_compiled_model(
@@ -404,7 +405,7 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
             "choice": choice,
             "native_max_seq_length": native_max_seq_length,
             "encode_lock": threading.Lock(),
-            "count_lock": threading.Lock(),
+            "tokenizer_lock": tokenizer_lock,
             "cuda_graphs": graph_runner,
         }
         _last_runtime_error = None
@@ -630,17 +631,22 @@ def resolve_backend(model_id: str, settings: dict[str, Any] | None = None) -> st
     return choice.backend
 
 
-def _count_tokenizer(cache_entry: dict[str, Any], tokenizer: Any) -> Any:
-    """Private tokenizer copy for counting; call with cache_entry["count_lock"] held.
+def _serialize_preprocess(model: Any, tokenizer_lock: Any) -> None:
+    """Run sentence-transformers' preprocess (tokenization) of every encode() pass with tokenizer_lock held.
 
-    The shared (Rust-backed) tokenizer is mutated with truncation settings by a concurrent model.encode and
-    must not be called with different settings outside encode_lock.
+    The shared (Rust-backed) tokenizer stores truncation/padding settings and every call re-applies its own,
+    so token counting (no truncation) and encode() (truncated to max_seq_length) must not overlap. One lock
+    around both lets counting use the model's own tokenizer: identical counts, no private copy (a deepcopy
+    was 35-250 MB of RAM per model and 0.7-1.9 s on the first request), and counting only waits for a
+    pass's tokenization, never for the GPU forward pass.
     """
-    count_tokenizer = cache_entry.get("count_tokenizer")
-    if count_tokenizer is None:
-        count_tokenizer = copy.deepcopy(tokenizer)
-        cache_entry["count_tokenizer"] = count_tokenizer
-    return count_tokenizer
+    original_preprocess = model.preprocess
+
+    def preprocess(*args: Any, **kwargs: Any) -> Any:
+        with tokenizer_lock:
+            return original_preprocess(*args, **kwargs)
+
+    model.preprocess = preprocess
 
 
 def _encode_text_rows(
@@ -670,10 +676,8 @@ def _encode_text_rows(
                 show_progress_bar=False,
             )
         )
-    with cache_entry["count_lock"]:
-        token_ids = _count_tokenizer(cache_entry, tokenizer)(
-            texts, add_special_tokens=True, truncation=False, verbose=False
-        )["input_ids"]
+    with cache_entry["tokenizer_lock"]:
+        token_ids = tokenizer(texts, add_special_tokens=True, truncation=False, verbose=False)["input_ids"]
     limit = int(max_seq_length or 0) or MAX_SEQ_LENGTH_LIMIT
     lengths = [min(len(ids), limit) for ids in token_ids]
     rows: list[Any] = [None] * len(texts)
@@ -702,14 +706,13 @@ def count_input_tokens(model_id: str, inputs: Sequence[Any], settings: dict[str,
         return TokenCounts(runtime_key.model_id, [], max_tokens, load_ms)
     texts = [str(item or "") for item in inputs if not isinstance(item, DecodedMedia)]
     media_texts = [item.text or "" for item in inputs if isinstance(item, DecodedMedia)]
-    with cache_entry["count_lock"]:
-        count_tokenizer = _count_tokenizer(cache_entry, tokenizer)
+    with cache_entry["tokenizer_lock"]:
         text_ids = (
-            count_tokenizer(texts, add_special_tokens=True, truncation=False, verbose=False)["input_ids"] if texts else []
+            tokenizer(texts, add_special_tokens=True, truncation=False, verbose=False)["input_ids"] if texts else []
         )
         # Media inputs: text part without special tokens; input_tokens() adds them once per input.
         media_ids = (
-            count_tokenizer(media_texts, add_special_tokens=False, truncation=False, verbose=False)["input_ids"]
+            tokenizer(media_texts, add_special_tokens=False, truncation=False, verbose=False)["input_ids"]
             if media_texts
             else []
         )

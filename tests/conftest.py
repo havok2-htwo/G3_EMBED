@@ -144,7 +144,7 @@ def fake_model(monkeypatch):
                 "choice": runtime_choice,
                 "native_max_seq_length": 8192,
                 "encode_lock": threading.Lock(),
-                "count_lock": threading.Lock(),
+                "tokenizer_lock": threading.RLock(),
             }
         return model, 0.0
 

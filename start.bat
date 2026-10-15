@@ -131,6 +131,9 @@ if "%NEEDS_FRONTEND_BUILD%"=="1" (
 echo Nutze lokale venv unter "%CD%\venv" ...
 echo Starte G3_EMBED auf http://127.0.0.1:8777 ...
 title G3 EMBED Server
+rem numpy/scipy's OpenBLAS starts one thread per core at import, each committing a never-used 32 MB buffer
+rem (~1.5 GB commit, no RAM). Torch has its own thread pool, so 4 BLAS threads cost no speed.
+if not defined OPENBLAS_NUM_THREADS set "OPENBLAS_NUM_THREADS=4"
 call "%VENV_PYTHON%" -m backend.genesis_embed_server
 
 echo.

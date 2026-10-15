@@ -73,6 +73,7 @@ Optional environment variables:
 
 - `GENESIS_TORCH_VARIANT=auto|cpu|cuda|xpu`
 - `HUGGINGFACE_TOKEN` or `HF_TOKEN`
+- `OPENBLAS_NUM_THREADS` (start scripts and Docker default to `4`; numpy/scipy's OpenBLAS otherwise starts one thread with a 32 MB buffer per core)
 
 ## Public API Example
 
