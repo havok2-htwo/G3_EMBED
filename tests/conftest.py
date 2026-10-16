@@ -37,6 +37,7 @@ finally:
     Path.write_text = _real_write_text
 
 from backend import genesis_embed_server_api as api  # noqa: E402
+from backend import genesis_embed_server_presets as presets  # noqa: E402
 from backend import genesis_embed_server_runtime as runtime  # noqa: E402
 from backend import genesis_embed_server_storage as storage  # noqa: E402
 from backend.genesis_embed_server_globals import current_settings, embedding_history  # noqa: E402
@@ -95,6 +96,7 @@ def isolated_state(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "LOGS_DIR", tmp_path)
     monkeypatch.setattr(storage, "SETTINGS_FILE", tmp_path / "genesis_embed_settings.json")
     monkeypatch.setattr(storage, "LOG_FILE", tmp_path / "embedding_log.jsonl")
+    monkeypatch.setattr(presets, "PRESETS_FILE", tmp_path / "genesis_embed_presets.json")
     monkeypatch.setattr(auth.get_auth_store(), "secrets_path", tmp_path / "genesis_embed_secrets.json")
     logged: list[dict] = []
     monkeypatch.setattr(api, "log_embedding", logged.append)
@@ -172,6 +174,26 @@ def client(fake_model):
     api.create_api(app)
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def admin_client(monkeypatch):
+    """TestClient on the admin routes, signed in, with model listing and runtime status stubbed out."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from backend import genesis_embed_server_admin as admin
+    from backend.genesis_embed_server_auth import require_admin
+
+    monkeypatch.setattr(admin, "list_model_statuses", lambda path: [])
+    monkeypatch.setattr(admin, "get_runtime_status", lambda: {})
+    # The GPU dropdown would probe CUDA through torch; tests stay off the GPU.
+    monkeypatch.setattr(admin, "gpu_device_options", lambda current=None: [{"label": "Auto (GPU 0)", "value": "auto"}])
+    app = FastAPI()
+    admin.create_admin_api(app)
+    app.dependency_overrides[require_admin] = lambda: {"username": "admin"}
+    with TestClient(app) as client:
+        yield client
 
 
 def model_files_cached(model_dir_name: str = "models--google--embeddinggemma-2") -> Path | None:

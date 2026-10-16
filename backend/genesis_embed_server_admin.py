@@ -33,6 +33,7 @@ from .genesis_embed_server_globals import (
 )
 from .genesis_embed_server_hardware import get_system_snapshot, gpu_device_options
 from .genesis_embed_server_model_manager import delete_model_cache, list_model_statuses, queue_model_download
+from .genesis_embed_server_presets import delete_user_preset, resolve_presets, save_user_preset
 from .genesis_embed_server_runtime import compare_vectors, encode_texts, get_runtime_status
 from .genesis_embed_server_storage import normalize_settings, save_settings
 
@@ -74,6 +75,11 @@ class AdminSettingsPayload(BaseModel):
     max_request_mb: int = 32
     media_pass_budget_mb: int = 1200
     max_concurrent_media_requests: int = 2
+
+
+class PresetPayload(BaseModel):
+    # Settings values; anything outside presets.PRESET_KEYS is dropped, the rest normalised like a saved setting.
+    values: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AdminModelActionPayload(BaseModel):
@@ -211,6 +217,29 @@ def create_admin_api(app: FastAPI) -> FastAPI:
             "models": list_model_statuses(normalized.get("model_cache_path", "")),
             "runtime": get_runtime_status(),
         }
+
+    # --- Settings presets (built-in GPU tiers + saved ones; loading fills the form, Save Settings applies) ---
+    @app.get("/api/admin/settings/presets")
+    async def admin_list_presets(_: dict[str, str] = Depends(require_admin)):
+        return {"presets": await asyncio.to_thread(resolve_presets)}
+
+    @app.put("/api/admin/settings/presets/{name}")
+    async def admin_save_preset(name: str, payload: PresetPayload, _: dict[str, str] = Depends(require_admin)):
+        try:
+            preset = await asyncio.to_thread(save_user_preset, name, payload.values)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "preset": preset}
+
+    @app.delete("/api/admin/settings/presets/{name}")
+    async def admin_delete_preset(name: str, _: dict[str, str] = Depends(require_admin)):
+        try:
+            deleted = await asyncio.to_thread(delete_user_preset, name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"No saved preset '{name[:100]}'.")
+        return {"ok": True}
 
     @app.get("/api/admin/system")
     async def admin_system(_: dict[str, str] = Depends(require_admin)):

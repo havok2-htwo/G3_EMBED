@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .genesis_embed_server_globals import (
@@ -148,6 +150,21 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     except OSError as exc:
         print(f"[G3_EMBED] Could not save settings: {exc}", file=sys.stderr)
     return normalized
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via a temp file in the same folder and os.replace, so a crash never leaves a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def log_embedding(entry: Dict[str, Any]) -> None:

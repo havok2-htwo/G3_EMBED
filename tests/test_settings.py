@@ -5,9 +5,7 @@ import json
 
 import pytest
 
-from backend import genesis_embed_server_admin as admin
 from backend.genesis_embed_server_admin import AdminSettingsPayload
-from backend.genesis_embed_server_auth import require_admin
 from backend.genesis_embed_server_globals import MEDIA_LIMIT_SETTINGS, MEDIA_TOGGLE_SETTINGS, current_settings
 from backend.genesis_embed_server_storage import DEFAULT_SETTINGS, normalize_settings, save_settings, load_settings
 
@@ -93,20 +91,6 @@ REQUIRED_FIELDS = {
     "warmup_on_load": False,
     "huggingface_token": "",
 }
-
-
-@pytest.fixture
-def admin_client(monkeypatch):
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    monkeypatch.setattr(admin, "list_model_statuses", lambda path: [])
-    monkeypatch.setattr(admin, "get_runtime_status", lambda: {})
-    app = FastAPI()
-    admin.create_admin_api(app)
-    app.dependency_overrides[require_admin] = lambda: {"username": "admin"}
-    with TestClient(app) as client:
-        yield client
 
 
 def test_put_settings_keeps_omitted_fields(admin_client, settings, tmp_path):

@@ -402,6 +402,7 @@ Updates settings:
 
 - `default_model`
 - `execution_target`
+- `gpu_device` (`auto` or `cuda:N`, numbered like nvidia-smi; optional, an omitted value keeps the stored GPU)
 - `backend_override`
 - `model_cache_path`
 - `batching_enabled`
@@ -434,6 +435,46 @@ Media settings (out-of-range values are clamped to `min-max`):
 - `max_request_mb` (default 32, 1-256; body size of `POST /embed` and `POST /v1/embeddings`, HTTP 413 above it)
 - `media_pass_budget_mb` (default 1200, 200-4096; estimated extra VRAM per media forward pass; audio clips count as padded to the longest clip of the pass)
 - `max_concurrent_media_requests` (default 2, 1-8; HTTP 429 when all slots are busy)
+
+### `GET /api/admin/settings/presets`
+
+Lists the settings presets: the built-in GPU tiers first, in tier order, then saved presets sorted by name. A preset is a set of settings values; applying one is a normal `PUT /api/admin/settings` (the dashboard's "Load into form" fills the form, Save Settings applies it), so a preset never bypasses validation.
+
+Built-in tiers (names identical across the G3 services, read-only):
+
+- `32GB VRAM`: RTX 5090, every G3 service on one card (whole-card peak <= 30 GB)
+- `24GB VRAM`: RTX 4090, every G3 service on one card (whole-card peak <= 23 GB)
+- `24+8 VRAM`: 3090 (24 GB) + 2070S (8 GB) box, EMBED on the 24 GB card. Its `values.gpu_device` is the CUDA card whose total memory is within 2 GiB of 24 GB, wherever it sits on this machine; with no such card `gpu_device` is left out and `note` says why.
+
+Single-card tiers never set `gpu_device`. There is no `8+24 VRAM` tier for EMBED (it runs on the 3090 next to RERANK).
+
+```json
+{
+  "presets": [
+    {
+      "name": "24+8 VRAM",
+      "built_in": true,
+      "description": "3090 + 2070S box, EMBED on the 3090 (24 GB) next to RERANK. ...",
+      "target_vram_gb": 24,
+      "note": null,
+      "values": { "batch_max_texts": 32, "precision": "auto", "gpu_device": "cuda:0", "...": "..." }
+    },
+    { "name": "lab", "built_in": false, "description": "", "created_at": "2026-10-16T12:00:00", "note": null, "values": { "batch_max_texts": 64 } }
+  ]
+}
+```
+
+Preset keys (everything else is dropped): `default_model`, `execution_target`, `gpu_device`, `backend_override`, `precision`, `quantization`, `compile_mode`, `cuda_graphs`, `warmup_on_load`, `batching_enabled`, `batch_wait_time_ms`, `batch_max_texts`, `batch_max_chars`, `encode_batch_size`, `encode_token_batching`, `max_seq_length`, `media_pass_budget_mb`, `max_concurrent_media_requests`. The cache path, the Hugging Face token, `too_long_policy` and the per-request media limits are never stored in a preset.
+
+### `PUT /api/admin/settings/presets/{name}`
+
+Saves (or replaces) a preset from `{"values": {...}}`, usually the current settings form. Values are filtered to the preset keys and normalised exactly like saved settings (clamped, invalid options reset). Names are trimmed, inner whitespace collapsed, at most 64 characters. Stored in `logs/genesis_embed_presets.json` next to the settings file. Returns `{"ok": true, "preset": {...}}`.
+
+HTTP 400: empty or too long name, a built-in tier name, or no preset key in `values`.
+
+### `DELETE /api/admin/settings/presets/{name}`
+
+Deletes a saved preset. HTTP 400 for a built-in tier, 404 when no saved preset has that name.
 
 ### `GET /api/admin/system`
 

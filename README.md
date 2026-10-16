@@ -124,6 +124,18 @@ Measured on an RTX 4090 (peak PyTorch allocation; add ~0.5 GB CUDA context). Ret
 
 At 4096 tokens Qwen3 is saturated at batch 1-2 and EmbeddingGemma 2 at batch 4; larger GPU batches only add VRAM. Embedding cosine vs. BF16: INT8 ~0.998, NF4 ~0.97-0.98.
 
+## Settings Presets
+
+The Settings panel has a "Presets" block: choose a preset, "Load into form" fills the settings form (nothing changes until Save Settings), "Save as preset" stores the current form under a name, "Delete preset" removes a saved one. Built-in GPU tiers, named identically in every G3 service and read-only:
+
+| Tier | Machine | GPU |
+|---|---|---|
+| `32GB VRAM` | RTX 5090, all G3 services on one card (whole-card peak <= 30 GB) | unchanged |
+| `24GB VRAM` | RTX 4090, all G3 services on one card (whole-card peak <= 23 GB) | unchanged |
+| `24+8 VRAM` | 3090 (24 GB) + 2070S (8 GB), EMBED on the 3090 next to RERANK | the card with ~24 GB, wherever it sits |
+
+There is no `8+24 VRAM` tier for EMBED. The tier values are currently the service defaults; measured values follow. Presets store only runtime, VRAM, batching, precision and device settings (`PRESET_KEYS` in `backend/genesis_embed_server_presets.py`), never the cache path or the Hugging Face token. Saved presets live in `logs/genesis_embed_presets.json`. API: see `API_DOCUMENTATION.md`.
+
 ## Query and Document Prompts
 
 `POST /embed` and `POST /v1/embeddings` accept an optional `input_type`:

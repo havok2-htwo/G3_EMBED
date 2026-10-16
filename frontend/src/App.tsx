@@ -1,4 +1,4 @@
-import { FormEvent, startTransition, useEffect, useState } from "react";
+import { FormEvent, startTransition, useEffect, useRef, useState } from "react";
 
 import {
   AdminOption,
@@ -11,6 +11,7 @@ import {
   MediaCounts,
   QueueResponse,
   RuntimeInfo,
+  SettingsPreset,
   SettingsResponse,
   StatsResponse,
   changePassword,
@@ -18,15 +19,18 @@ import {
   createApiKey,
   deleteApiKey,
   deleteModel,
+  deletePreset,
   downloadModel,
   getModels,
   getQueue,
   getSettings,
   getStats,
   listApiKeys,
+  listPresets,
   login,
   logout,
   runBenchmark,
+  savePreset,
   saveSettings,
   whoami,
 } from "./api";
@@ -320,6 +324,12 @@ export default function App() {
   const [queue, setQueue] = useState<QueueResponse | null>(null);
   const [queueHistory, setQueueHistory] = useState<QueuePoint[]>([]);
   const [saveBusy, setSaveBusy] = useState(false);
+  // True while the settings form holds edits (or a loaded preset) that are not saved yet: the 5 s dashboard poll
+  // then leaves the form alone instead of overwriting it with the stored settings.
+  const settingsDirty = useRef(false);
+  const [presets, setPresets] = useState<SettingsPreset[]>([]);
+  const [presetName, setPresetName] = useState("");
+  const [presetBusy, setPresetBusy] = useState(false);
   const [modelBusyId, setModelBusyId] = useState("");
   const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
   const [compareTextA, setCompareTextA] = useState("Genesis stores memories as vectors.");
@@ -338,7 +348,9 @@ export default function App() {
 
   function applySettings(payload: SettingsResponse) {
     // Merge with defaults so an older backend without newer fields cannot crash the render.
-    setSettingsForm({ ...emptySettings, ...payload.settings });
+    if (!settingsDirty.current) {
+      setSettingsForm({ ...emptySettings, ...payload.settings });
+    }
     setSettingsOptions({ ...emptyOptions, ...payload.options });
     setManagedModels(payload.models ?? []);
     setRuntime(payload.runtime);
@@ -360,7 +372,10 @@ export default function App() {
       setQueue(null);
       setRuntime(null);
       setManagedModels([]);
+      settingsDirty.current = false;
       setSettingsForm(emptySettings);
+      setPresets([]);
+      setPresetName("");
       setSettingsOptions(emptyOptions);
       setApiKeys([]);
       setCreatedKey(null);
@@ -545,6 +560,7 @@ export default function App() {
     setGlobalError("");
     try {
       const response = await saveSettings(settingsForm);
+      settingsDirty.current = false;
       applySettings(response);
       setActionMessage("Settings saved.");
     } catch (error) {
@@ -640,7 +656,78 @@ export default function App() {
   }
 
   function updateSetting<K extends keyof AdminSettings>(key: K, value: AdminSettings[K]) {
+    settingsDirty.current = true;
     setSettingsForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function handleDiscardSettings() {
+    settingsDirty.current = false;
+    setActionMessage("");
+    void refreshDashboard();
+  }
+
+  const selectedPreset = presets.find((preset) => preset.name === presetName);
+
+  async function reloadPresets() {
+    try {
+      setPresets((await listPresets()).presets);
+    } catch (error) {
+      handleApiError(error, "Presets could not be loaded.");
+    }
+  }
+
+  useEffect(() => {
+    // Loaded once per sign-in; saving or deleting reloads explicitly.
+    if (isReady) void reloadPresets();
+  }, [authState]);
+
+  function handleLoadPreset() {
+    if (!selectedPreset) return;
+    setActionMessage("");
+    setGlobalError("");
+    // Into the form only: Save Settings applies it through the normal validated PUT.
+    settingsDirty.current = true;
+    setSettingsForm((current) => ({ ...current, ...selectedPreset.values }));
+    setActionMessage(
+      `Preset "${selectedPreset.name}" loaded into the form; review it and click Save Settings to apply.` +
+        (selectedPreset.note ? ` ${selectedPreset.note}` : ""),
+    );
+  }
+
+  async function handleSavePreset() {
+    const name = presetName.trim();
+    if (!name) return;
+    setPresetBusy(true);
+    setActionMessage("");
+    setGlobalError("");
+    try {
+      const response = await savePreset(name, settingsForm);
+      await reloadPresets();
+      setPresetName(response.preset.name);
+      setActionMessage(`Preset "${response.preset.name}" saved from the current form.`);
+    } catch (error) {
+      handleApiError(error, "Preset could not be saved.");
+    } finally {
+      setPresetBusy(false);
+    }
+  }
+
+  async function handleDeletePreset() {
+    if (!selectedPreset || selectedPreset.built_in) return;
+    const name = selectedPreset.name;
+    setPresetBusy(true);
+    setActionMessage("");
+    setGlobalError("");
+    try {
+      await deletePreset(name);
+      setPresetName("");
+      await reloadPresets();
+      setActionMessage(`Preset "${name}" deleted.`);
+    } catch (error) {
+      handleApiError(error, "Preset could not be deleted.");
+    } finally {
+      setPresetBusy(false);
+    }
   }
 
   if (authState === "loading") {
@@ -897,6 +984,36 @@ export default function App() {
               <h2>Model, backend, batching</h2>
             </div>
           </div>
+          <span className="eyebrow">Presets</span>
+          <p className="section-copy">
+            Built-in GPU tiers: 32GB VRAM (RTX 5090) and 24GB VRAM (RTX 4090) with every G3 service on one card; 24+8 VRAM runs
+            EMBED on the 24 GB card of a 3090 + 2070S box (the GPU is picked by card size). Loading fills the form below;
+            Save Settings applies it.
+          </p>
+          <div className="settings-form">
+            <label>
+              <span>Preset</span>
+              <select value={selectedPreset ? presetName : ""} onChange={(event) => setPresetName(event.target.value)}>
+                <option value="">(choose)</option>
+                {presets.map((preset) => (
+                  <option key={preset.name} value={preset.name}>{preset.built_in ? `${preset.name} (built-in)` : preset.name}</option>
+                ))}
+              </select>
+              {selectedPreset?.description ? <small className="muted">{selectedPreset.description}</small> : null}
+              {selectedPreset?.note ? <small className="muted">{selectedPreset.note}</small> : null}
+            </label>
+            <label>
+              <span>Save the current form as</span>
+              <input value={presetName} maxLength={64} placeholder="preset name" onChange={(event) => setPresetName(event.target.value)} />
+              <small className="muted">Built-in names cannot be overwritten. The cache path and the Hugging Face token are never stored in a preset.</small>
+            </label>
+            <div className="button-row full-width">
+              <button type="button" className="secondary-button" onClick={handleLoadPreset} disabled={!selectedPreset || presetBusy || saveBusy}>Load into form</button>
+              <button type="button" className="secondary-button" onClick={() => void handleSavePreset()} disabled={!presetName.trim() || selectedPreset?.built_in === true || presetBusy}>Save as preset</button>
+              <button type="button" className="ghost-button danger-button" onClick={() => void handleDeletePreset()} disabled={!selectedPreset || selectedPreset.built_in || presetBusy}>Delete preset</button>
+            </div>
+          </div>
+          <div className="panel-divider" />
           <form className="settings-form" onSubmit={handleSaveSettings}>
             <label>
               <span>Default Model</span>
@@ -1026,6 +1143,7 @@ export default function App() {
             ))}
             <div className="form-actions full-width">
               <button type="submit" disabled={saveBusy}>{saveBusy ? "Saving..." : "Save Settings"}</button>
+              <button type="button" className="ghost-button" disabled={saveBusy} onClick={handleDiscardSettings}>Discard changes</button>
             </div>
           </form>
         </section>
