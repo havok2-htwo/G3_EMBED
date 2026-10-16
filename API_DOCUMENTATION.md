@@ -453,7 +453,7 @@ Built-in tiers (names identical across the G3 services, read-only):
 - `24GB VRAM`: RTX 4090, every G3 service on one card (whole-card peak <= 23 GB)
 - `24+8 VRAM`: 3090 (24 GB) + 2070S (8 GB) box, EMBED on the 24 GB card. Its `values.gpu_device` is the CUDA card whose total memory is within 2 GiB of 24 GB, wherever it sits on this machine; with no such card `gpu_device` is left out and `note` says why.
 
-Single-card tiers never set `gpu_device`. There is no `8+24 VRAM` tier for EMBED (it runs on the 3090 next to RERANK; the 2070S has no bf16).
+Single-card tiers never set `gpu_device`. A fresh install (no saved settings file, or only the Docker entrypoint's `_first_start_seed` file) starts with the defaults plus `24GB VRAM` and saves them, so `GET /api/admin/settings` returns the tier values from the first start; existing settings files are never changed. There is no `8+24 VRAM` tier for EMBED (it runs on the 3090 next to RERANK; the 2070S has no bf16).
 
 Tier values, measured on an RTX 5090 (EmbeddingGemma 2 bf16, CUDA graphs, `compile_mode` off, window 4096, idle trim 5 s): `32GB VRAM` `encode_batch_size` 4, about 3.0 GB idle and 5.3 GB peak process VRAM; `24GB VRAM` and `24+8 VRAM` `encode_batch_size` 2, about 3.0 GB idle and 4.1 GB peak (~91 % of the batch-4 ingestion throughput). Every tier lists every preset key except `gpu_device`.
 
