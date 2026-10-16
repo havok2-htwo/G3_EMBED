@@ -18,7 +18,7 @@ from .genesis_embed_server_batching import EmbedBatchManager
 from .genesis_embed_server_globals import current_settings
 from .genesis_embed_server_model_manager import list_model_statuses
 from .genesis_embed_server_runtime import encode_texts
-from .genesis_embed_server_storage import load_settings
+from .genesis_embed_server_presets import FIRST_START_PRESET, load_settings_or_first_start_preset
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
@@ -49,8 +49,11 @@ def _preload_default_model(model_id: str, cache_path: str) -> None:
 
 async def startup_server(app: FastAPI) -> None:
     print("--- G3_EMBED Server starting (FastAPI + React + local embeddings) ---", file=sys.stderr)
+    loaded, first_start = load_settings_or_first_start_preset()
     current_settings.clear()
-    current_settings.update(load_settings())
+    current_settings.update(loaded)
+    if first_start:
+        print(f"[G3_EMBED] First start: no saved settings, applied the '{FIRST_START_PRESET}' preset.", file=sys.stderr)
     print(
         f"Loaded settings: model='{current_settings['default_model']}', "
         f"target='{current_settings['execution_target']}', "

@@ -22,11 +22,17 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from . import genesis_embed_server_storage as storage
 from .genesis_embed_server_globals import LOGS_DIR
 from .genesis_embed_server_hardware import get_system_snapshot
 from .genesis_embed_server_storage import _atomic_write_text, normalize_settings
 
 PRESETS_FILE = LOGS_DIR / "genesis_embed_presets.json"
+# A fresh install (no saved settings yet) starts with this tier; the same in every G3 service.
+FIRST_START_PRESET = "24GB VRAM"
+# docker/entrypoint.sh seeds machine paths (model_cache_path) into a settings file carrying this marker before the
+# server starts; such a file still counts as a first start, and its seeded values are kept.
+FIRST_START_SEED_MARKER = "_first_start_seed"
 PRESET_NAME_MAX_LENGTH = 64
 
 # Keys a preset may set: runtime, VRAM, batching, precision and device behaviour. Machine-specific values
@@ -226,3 +232,27 @@ def delete_user_preset(name: str) -> bool:
         presets.pop(clean)
         _atomic_write_text(PRESETS_FILE, json.dumps(presets, indent=2, ensure_ascii=True))
     return True
+
+
+def _first_start_seed() -> Optional[Dict[str, Any]]:
+    """The values of an entrypoint seed file (marker set), {} without a settings file, None for saved settings."""
+    if not storage.SETTINGS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(storage.SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if isinstance(data, dict) and data.get(FIRST_START_SEED_MARKER) is True:
+        return {key: value for key, value in data.items() if key != FIRST_START_SEED_MARKER}
+    return None
+
+
+def load_settings_or_first_start_preset() -> tuple[Dict[str, Any], bool]:
+    """The saved settings; on a first start (no settings file, or only the docker entrypoint's seed) the defaults with
+    FIRST_START_PRESET applied, seeded values on top, and saved, so the dashboard shows what runs.
+    Returns (settings, applied)."""
+    seed = _first_start_seed()
+    if seed is None:
+        return storage.load_settings(), False
+    values = dict(BUILTIN_PRESETS[FIRST_START_PRESET]["values"])
+    return storage.save_settings({**storage.DEFAULT_SETTINGS, **values, **seed}), True

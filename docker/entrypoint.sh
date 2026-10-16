@@ -3,23 +3,18 @@ set -euo pipefail
 
 # Seed a container-friendly settings file on first boot so models land in the
 # mounted /app/models volume instead of the Windows-style ".\models" default.
-# Existing settings (e.g. an admin changed the cache path) are left untouched.
+# The "_first_start_seed" marker tells the server this is still a first start:
+# it applies the "24GB VRAM" preset on top of the defaults, keeps the seeded
+# cache path and saves the result (backend/genesis_embed_server_presets.py,
+# load_settings_or_first_start_preset). Existing settings (e.g. an admin changed
+# the cache path) are left untouched.
 SETTINGS_FILE="/app/logs/genesis_embed_settings.json"
 if [[ ! -f "$SETTINGS_FILE" ]]; then
   mkdir -p /app/logs
   cat > "$SETTINGS_FILE" <<'JSON'
 {
-  "execution_target": "auto",
-  "backend_override": "auto",
-  "model_cache_path": "/app/models",
-  "batching_enabled": true,
-  "batch_wait_time_ms": 25,
-  "batch_max_texts": 32,
-  "batch_max_chars": 64000,
-  "precision": "auto",
-  "compile_mode": "off",
-  "warmup_on_load": false,
-  "huggingface_token": ""
+  "_first_start_seed": true,
+  "model_cache_path": "/app/models"
 }
 JSON
 fi

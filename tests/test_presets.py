@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -178,3 +179,40 @@ def test_admin_preset_routes(admin_client, monkeypatch):
     assert admin_client.delete("/api/admin/settings/presets/24GB VRAM").status_code == 400
     assert admin_client.delete("/api/admin/settings/presets/lab").status_code == 200
     assert admin_client.delete("/api/admin/settings/presets/lab").status_code == 404
+
+
+def test_first_start_applies_the_24gb_tier_and_saves_it():
+    from backend import genesis_embed_server_storage as storage
+
+    assert not storage.SETTINGS_FILE.exists()
+    settings, applied = presets.load_settings_or_first_start_preset()
+    assert applied is True
+    for key, value in presets.BUILTIN_PRESETS["24GB VRAM"]["values"].items():
+        assert settings[key] == value, key
+    assert settings["gpu_device"] == "auto", "a single-card tier never sets the GPU"
+    assert storage.SETTINGS_FILE.exists()
+    assert storage.load_settings() == settings
+
+
+def test_saved_settings_are_kept_on_later_starts():
+    from backend import genesis_embed_server_storage as storage
+
+    storage.save_settings({**storage.DEFAULT_SETTINGS, "encode_batch_size": 8, "cuda_graphs": False})
+    settings, applied = presets.load_settings_or_first_start_preset()
+    assert applied is False
+    assert (settings["encode_batch_size"], settings["cuda_graphs"]) == (8, False)
+
+
+def test_docker_entrypoint_seed_still_counts_as_first_start():
+    from backend import genesis_embed_server_storage as storage
+
+    script = (Path(__file__).resolve().parent.parent / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+    seed = script.split("<<'JSON'\n", 1)[1].split("\nJSON\n", 1)[0]
+    storage.SETTINGS_FILE.write_text(seed, encoding="utf-8")
+    settings, applied = presets.load_settings_or_first_start_preset()
+    assert applied is True
+    assert settings["model_cache_path"] == "/app/models"
+    assert settings["encode_batch_size"] == presets.BUILTIN_PRESETS["24GB VRAM"]["values"]["encode_batch_size"]
+    saved = json.loads(storage.SETTINGS_FILE.read_text(encoding="utf-8"))
+    assert presets.FIRST_START_SEED_MARKER not in saved
+    assert presets.load_settings_or_first_start_preset()[1] is False
