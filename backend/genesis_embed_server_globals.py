@@ -40,7 +40,10 @@ MODEL_SPECS: Dict[str, Dict[str, Any]] = {
         "cuda_graphs": True,
         "query_prompt": "task: search result | query: ",
         "document_prompt": "title: none | text: ",
-        "notes": "Default. Multilingual, 8k context, 768 dims. ~1.9 GB VRAM at 4096 tokens, batch 1; ~3.3 GB at batch 4.",
+        # Process VRAM (CUDA context, model, graph pool and pass), measured bf16 with CUDA graphs on an RTX 5090;
+        # torch-allocated alone is ~1.9 / 3.4 GB.
+        "notes": "Default. Multilingual, 8k context, 768 dims. ~3.0 GB VRAM idle; ~3.6 GB at 4096 tokens, batch 1; "
+        "~5.3 GB at batch 4 (process, CUDA graphs on).",
         # Accepts image, audio and video (frame list) inputs; other models are text-only.
         "modalities": ["image", "audio", "video"],
         # Extra VRAM per forward pass, measured bf16 / sdpa / eager on an RTX 4090 (independent of image

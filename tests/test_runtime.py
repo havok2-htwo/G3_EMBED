@@ -303,3 +303,103 @@ def test_serialize_preprocess_holds_the_lock_during_tokenization():
     assert model.preprocess(["x"], prompt="p") == {"input_ids": ["x"]}
     assert seen == [(True, ["x"], "p")]
     assert not lock._is_owned()
+
+
+# --- torch.compile effectiveness ------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dynamo(monkeypatch):
+    import torch._dynamo
+
+    torch._dynamo.reset()
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
+    yield torch._dynamo
+    torch._dynamo.reset()
+
+
+def _broken_backend(gm, example_inputs):
+    raise RuntimeError("Failed to find C compiler. Please specify via CC environment variable.")
+
+
+def test_compile_probe_detects_the_eager_fallback(dynamo):
+    compiled = torch.compile(lambda x: x * 2 + 1, backend=_broken_backend)
+    with runtime._CompileProbe() as probe:
+        # suppress_errors: the call still works, eagerly.
+        assert torch.equal(compiled(torch.ones(3)), torch.full((3,), 3.0))
+    result = probe.result()
+    assert result["effective"] is False and result["graphs"] == 0 and result["failed_frames"] >= 1
+    assert "Failed to find C compiler" in result["reason"]
+
+
+def test_compile_probe_reports_compiled_graphs(dynamo):
+    compiled = torch.compile(lambda x: x * 3 - 1, backend=lambda gm, example_inputs: gm.forward)
+    with runtime._CompileProbe() as probe:
+        compiled(torch.ones(3))
+    assert probe.result() == {"effective": True, "graphs": 1, "failed_frames": 0, "reason": None}
+    # Nothing new to compile (graphs reused) is not a failure.
+    with runtime._CompileProbe() as probe:
+        compiled(torch.ones(3))
+    assert probe.result()["effective"] is True
+
+
+def test_compiled_warmup_reports_a_silent_fallback(fake_model, dynamo, capsys):
+    compiled = torch.compile(lambda x: x + 1, backend=_broken_backend)
+    encode = fake_model.encode
+
+    def encode_through_a_broken_graph(inputs, batch_size=32, **kwargs):
+        compiled(torch.ones(batch_size))
+        return encode(inputs, batch_size=batch_size, **kwargs)
+
+    fake_model.encode = encode_through_a_broken_graph
+    status = runtime._warmup_compiled_model(fake_model, 4096, 2)
+    assert status["effective"] is False and "Failed to find C compiler" in status["reason"]
+    output = capsys.readouterr().out
+    assert "torch.compile NOT effective" in output and "warmup finished" not in output
+
+
+class _LoadedST:
+    max_seq_length = 8192
+    training = False
+    device = "cuda:0"
+
+    def __init__(self, model_id, **kwargs):
+        pass
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def eval(self):
+        return self
+
+    def preprocess(self, *args, **kwargs):
+        return {}
+
+
+@pytest.mark.parametrize("compiled", [True, False])
+def test_load_reports_compile_and_releases_the_warmup_cache_before_graph_capture(monkeypatch, compiled):
+    import sentence_transformers
+
+    order = []
+    status = {"effective": False, "graphs": 0, "failed_frames": 4, "reason": "RuntimeError: Failed to compile"}
+    monkeypatch.setattr(sentence_transformers, "SentenceTransformer", _LoadedST)
+    monkeypatch.setattr(runtime, "_bind_cuda_device", lambda device: None)
+    monkeypatch.setattr(runtime, "_disable_sdpa_gqa", lambda: None)
+    monkeypatch.setattr(runtime, "_model_kwargs_for_precision", lambda *args: {})
+    monkeypatch.setattr(runtime, "_maybe_compile_sentence_transformer", lambda *args: compiled)
+    monkeypatch.setattr(runtime, "_warmup_compiled_model", lambda *args: order.append("warmup") or status)
+    monkeypatch.setattr(runtime, "_release_cuda_cache", lambda: order.append("release"))
+    monkeypatch.setattr(runtime, "_empty_cuda_cache", lambda: order.append("empty"))
+    monkeypatch.setattr(runtime, "_install_cuda_graphs", lambda model: order.append("graphs"))
+    key = runtime.RuntimeKey(GEMMA, "pytorch", "cuda:0", "auto", "regional", cuda_graphs=True)
+    choice = RuntimeChoice("pytorch", "cuda:0", "GPU", "test", "test")
+    runtime._load_model(key, {}, choice)
+    if compiled:
+        assert order == ["release", "warmup", "empty", "graphs"]
+        assert runtime._model_cache[key]["compile"] == status
+    else:
+        assert order == ["release", "empty", "graphs"]
+        assert runtime._model_cache[key]["compile"]["effective"] is False
+        assert "not applied" in runtime._model_cache[key]["compile"]["reason"]
+    monkeypatch.setattr(runtime, "get_system_snapshot", lambda: {})
+    assert runtime.get_runtime_status()["loaded_models"][0]["compile"] == runtime._model_cache[key]["compile"]

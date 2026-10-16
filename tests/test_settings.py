@@ -111,3 +111,11 @@ def test_put_settings_applies_sent_fields(admin_client, settings):
     )
     assert response.status_code == 200
     assert current_settings["video_inputs_enabled"] is True and current_settings["max_video_frames"] == 16
+
+
+def test_put_settings_idle_trim_seconds(admin_client, settings):
+    settings(idle_trim_seconds=30)
+    assert admin_client.put("/api/admin/settings", json=REQUIRED_FIELDS).status_code == 200
+    assert current_settings["idle_trim_seconds"] == 30, "an omitted idle_trim_seconds keeps its value"
+    assert admin_client.put("/api/admin/settings", json={**REQUIRED_FIELDS, "idle_trim_seconds": 99999}).status_code == 200
+    assert current_settings["idle_trim_seconds"] == 3600

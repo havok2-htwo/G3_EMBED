@@ -33,7 +33,10 @@ from .genesis_embed_server_media import (
 # Free memory (beyond the pass estimate) a media pass must leave for the other services on the GPU.
 CUDA_MEDIA_MARGIN_MB = 256
 # Most texts per forward pass when packing by tokens. Short texts are overhead-bound (EmbeddingGemma 2 on an
-# RTX 4090: ~25 ms per pass whether it holds 4 or 64 short texts); beyond 128 the gain is small.
+# RTX 4090: ~25 ms per pass whether it holds 4 or 64 short texts); beyond 128 the gain is small. This only caps
+# rows; the token budget (encode_batch_size x window) sizes the pass. A bigger budget is not always faster: on an
+# RTX 5090 encode_batch_size 8 and 16 were slower than 4 for every workload (512-token chunks 305 / 266 vs
+# 327 chunks/s, a mixed document batch 115 / 79 vs 133 texts/s) while the peak grew from 5.3 to 7.6 / 12.3 GB.
 TOKEN_BATCH_MAX_ROWS = 128
 
 
@@ -257,8 +260,69 @@ def _maybe_compile_sentence_transformer(model: Any, compile_mode: str, choice: R
         return False
 
 
-def _warmup_compiled_model(model: Any, max_seq_length: int | None, encode_batch_size: int) -> None:
-    """Trigger compilation at load time instead of on the first requests.
+class _CompileProbe(logging.Handler):
+    """Whether dynamo really compiled anything while active, and why not.
+
+    With suppress_errors a frame whose graph fails to compile (e.g. Triton cannot build its C helper) silently runs
+    eager. Dynamo counts converted frames ("frames": "total" / "ok") and successfully compiled graphs ("stats":
+    "unique_graphs"), and logs the suppressed error on torch._dynamo.convert_frame; the probe diffs the counters
+    and keeps the first such error.
+    """
+
+    _LOGGER = "torch._dynamo.convert_frame"
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.reason: str | None = None
+        self._start: tuple[int, int, int] = (0, 0, 0)
+        self._end: tuple[int, int, int] | None = None
+
+    @staticmethod
+    def _counts() -> tuple[int, int, int]:
+        try:
+            from torch._dynamo.utils import counters
+        except Exception:
+            return 0, 0, 0
+        return int(counters["frames"]["total"]), int(counters["frames"]["ok"]), int(counters["stats"]["unique_graphs"])
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.reason is not None:
+            return
+        error = record.exc_info[1] if record.exc_info else None
+        # BackendCompilerFailed only says which backend failed; the root cause names the real problem.
+        for _ in range(8):
+            inner = getattr(error, "inner_exception", None) or getattr(error, "__cause__", None)
+            if inner is None:
+                break
+            error = inner
+        text = f"{type(error).__name__}: {error}" if error is not None else record.getMessage()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        self.reason = (lines[0] if lines else text)[:300]
+
+    def __enter__(self) -> "_CompileProbe":
+        self._start = self._counts()
+        logging.getLogger(self._LOGGER).addHandler(self)
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        logging.getLogger(self._LOGGER).removeHandler(self)
+        self._end = self._counts()
+
+    def result(self) -> dict[str, Any]:
+        end = self._end if self._end is not None else self._counts()
+        frames = end[0] - self._start[0]
+        failed = frames - (end[1] - self._start[1])
+        graphs = end[2] - self._start[2]
+        # No converted frame at all means dynamo reused graphs it already had (e.g. a second variant of the model).
+        effective = not (failed > 0 and graphs == 0)
+        reason = None
+        if failed > 0:
+            reason = self.reason or f"{failed} frame(s) fell back to eager"
+        return {"effective": effective, "graphs": graphs, "failed_frames": failed, "reason": reason}
+
+
+def _warmup_compiled_model(model: Any, max_seq_length: int | None, encode_batch_size: int) -> dict[str, Any]:
+    """Trigger compilation at load time instead of on the first requests; returns whether compile took effect.
 
     Batch size 1 is specialized, and attention masks differ between short/long and padded/unpadded
     batches (sliding-window layers), so warm up each combination the configured batch size can produce.
@@ -270,15 +334,31 @@ def _warmup_compiled_model(model: Any, max_seq_length: int | None, encode_batch_
     batches: list[list[str]] = [["warmup"], [long_text]]
     if encode_batch_size >= 2:
         batches += [["warmup", long_text], ["warmup", "warmup"], [long_text, long_text]]
-    try:
-        for texts in batches:
-            model.encode(_wrap_texts(texts), batch_size=len(texts), convert_to_numpy=True, show_progress_bar=False)
-    except Exception as exc:
-        # Keep the model usable; anything not compiled here compiles lazily on first use.
-        print(f"[G3_EMBED] torch.compile warmup failed: {exc}", flush=True)
-        _release_cuda_cache()
-        return
-    print(f"[G3_EMBED] torch.compile warmup finished in {time.perf_counter() - started:.1f} s", flush=True)
+    with _CompileProbe() as probe:
+        try:
+            for texts in batches:
+                model.encode(_wrap_texts(texts), batch_size=len(texts), convert_to_numpy=True, show_progress_bar=False)
+        except Exception as exc:
+            # Keep the model usable; anything not compiled here compiles lazily on first use.
+            print(f"[G3_EMBED] torch.compile warmup failed: {exc}", flush=True)
+            _release_cuda_cache()
+            return {**probe.result(), "effective": False, "reason": f"warmup failed: {str(exc)[:300]}"}
+    status = probe.result()
+    seconds = time.perf_counter() - started
+    if not status["effective"]:
+        print(
+            f"[G3_EMBED] torch.compile NOT effective, the model runs eager ({seconds:.1f} s spent): {status['reason']}",
+            flush=True,
+        )
+    elif status["reason"]:
+        print(
+            f"[G3_EMBED] torch.compile warmup finished in {seconds:.1f} s, {status['graphs']} graph(s); "
+            f"{status['failed_frames']} frame(s) run eager: {status['reason']}",
+            flush=True,
+        )
+    else:
+        print(f"[G3_EMBED] torch.compile warmup finished in {seconds:.1f} s, {status['graphs']} graph(s)", flush=True)
+    return status
 
 
 def _skip_redundant_to_and_eval(model: Any) -> None:
@@ -403,14 +483,22 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
         tokenizer_lock = threading.RLock()
         _serialize_preprocess(model, tokenizer_lock)
 
+        compile_status: dict[str, Any] | None = None
         if compiled:
-            _warmup_compiled_model(
+            compile_status = _warmup_compiled_model(
                 model,
                 _effective_max_seq_length(runtime_key.model_id, settings, native_max_seq_length),
                 _effective_encode_batch_size(runtime_key.model_id, settings, 2),
             )
         elif settings.get("warmup_on_load"):
             model.encode(_wrap_texts(["warmup"]), normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
+        if runtime_key.compile_mode != "off" and compile_status is None:
+            reason = "not applied: CPU/OpenVINO, quantized or no Triton (see log)"
+            compile_status = {"effective": False, "graphs": 0, "failed_frames": 0, "reason": reason}
+        if runtime_key.cuda_graphs and _is_cuda_pytorch(choice):
+            # The warmup's cached blocks would otherwise sit in the reserved count the graph memory is measured
+            # against, and stay reserved next to the graph pool.
+            _empty_cuda_cache()
         graph_runner = _install_cuda_graphs(model) if runtime_key.cuda_graphs else None
 
         load_ms = (time.perf_counter() - load_started) * 1000
@@ -423,6 +511,8 @@ def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: Runti
             "encode_lock": threading.Lock(),
             "tokenizer_lock": tokenizer_lock,
             "cuda_graphs": graph_runner,
+            # None when compile_mode is off; else whether dynamo really compiled (see _CompileProbe).
+            "compile": compile_status,
         }
         _last_runtime_error = None
         print(
@@ -453,6 +543,137 @@ def _empty_cuda_cache() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+# --- idle trim -----------------------------------------------------------------------------------------------
+# A text pass leaves its working set reserved by the caching allocator (EmbeddingGemma 2 at encode_batch_size 4:
+# ~5.3 GB process VRAM instead of ~3.0 GB idle, ~12.3 GB at 16) until something calls empty_cache(). The trim
+# thread does that idle_trim_seconds after the last encode_texts / encode_inputs call finished, holding every
+# model's encode_lock (so no pass runs meanwhile) and the model cache lock (no load or graph capture runs).
+# empty_cache() only returns unused cached blocks: the CUDA graph pool stays, captured graphs keep working.
+
+_IDLE_TRIM_POLL_SECONDS = 5.0
+_idle_cond = threading.Condition()
+_idle_state: dict[str, Any] = {
+    "busy": 0,
+    "last_activity": time.monotonic(),
+    "pending": False,
+    "thread": None,
+}
+_trim_stats: dict[str, Any] = {"trims": 0, "last_trim_at": None, "last_freed_mb": None}
+
+
+def _idle_trim_seconds() -> int:
+    with settings_lock:
+        return max(0, int(current_settings.get("idle_trim_seconds", 5) or 0))
+
+
+def _begin_activity() -> None:
+    with _idle_cond:
+        _idle_state["busy"] += 1
+
+
+def _end_activity(on_cuda: bool) -> None:
+    """Mark an encode call as finished; one that ran on CUDA schedules the idle trim."""
+    with _idle_cond:
+        _idle_state["busy"] = max(0, _idle_state["busy"] - 1)
+        _idle_state["last_activity"] = time.monotonic()
+        if on_cuda and _idle_trim_seconds() > 0:
+            _idle_state["pending"] = True
+            _ensure_idle_trim_thread()
+        _idle_cond.notify_all()
+
+
+def _ensure_idle_trim_thread() -> None:
+    # Call with _idle_cond held.
+    thread = _idle_state["thread"]
+    if thread is None or not thread.is_alive():
+        thread = threading.Thread(target=_idle_trim_worker, name="g3-embed-idle-trim", daemon=True)
+        _idle_state["thread"] = thread
+        thread.start()
+
+
+def _next_idle_trim_wait() -> float | None:
+    """Seconds until the pending trim is due (0 = now), None when nothing is pending; call with _idle_cond held."""
+    if not _idle_state["pending"]:
+        return None
+    seconds = _idle_trim_seconds()
+    if seconds <= 0:
+        _idle_state["pending"] = False
+        return None
+    if _idle_state["busy"]:
+        return _IDLE_TRIM_POLL_SECONDS
+    return max(0.0, _idle_state["last_activity"] + seconds - time.monotonic())
+
+
+def _idle_trim_worker() -> None:
+    while True:
+        with _idle_cond:
+            while True:
+                if _idle_state["thread"] is not threading.current_thread():
+                    return  # replaced (tests reset the state)
+                wait = _next_idle_trim_wait()
+                if wait == 0:
+                    break
+                # Re-checked at least every poll interval, so a changed idle_trim_seconds applies.
+                _idle_cond.wait(_IDLE_TRIM_POLL_SECONDS if wait is None else min(wait, _IDLE_TRIM_POLL_SECONDS))
+            _idle_state["pending"] = False
+        try:
+            trim_memory()
+        except Exception as exc:  # noqa: BLE001 - the trim must never kill its thread
+            print(f"[G3_EMBED] Idle trim failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def trim_memory() -> dict[str, Any]:
+    """Return cached, unused CUDA allocator blocks to the driver (CUDA graph pools are kept)."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+            return {"trimmed": False, "reason": "CUDA not initialised"}
+    except Exception:
+        return {"trimmed": False, "reason": "torch unavailable"}
+    with _model_cache_lock:
+        entries = list(_model_cache.values())
+        devices = sorted({entry["choice"].device for entry in entries if _is_cuda_pytorch(entry["choice"])})
+        locks = [entry["encode_lock"] for entry in entries]
+        for lock in locks:
+            lock.acquire()
+        try:
+            if devices:
+                _bind_cuda_device(devices[0])
+            reserved_before = sum(torch.cuda.memory_reserved(torch.device(device)) for device in devices)
+            torch.cuda.empty_cache()
+            reserved_after = sum(torch.cuda.memory_reserved(torch.device(device)) for device in devices)
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+    freed_mb = round((reserved_before - reserved_after) / (1024 * 1024), 1)
+    _trim_stats["trims"] += 1
+    _trim_stats["last_trim_at"] = time.time()
+    _trim_stats["last_freed_mb"] = freed_mb
+    if freed_mb >= 64:
+        print(f"[G3_EMBED] Idle trim: {freed_mb:.0f} MB of cached CUDA memory released", flush=True)
+    return {
+        "trimmed": True,
+        "reserved_before_mb": round(reserved_before / (1024 * 1024), 1),
+        "reserved_after_mb": round(reserved_after / (1024 * 1024), 1),
+        "freed_mb": freed_mb,
+    }
+
+
+def idle_trim_status() -> dict[str, Any]:
+    with _idle_cond:
+        pending = bool(_idle_state["pending"])
+        busy = int(_idle_state["busy"])
+        idle_seconds = time.monotonic() - _idle_state["last_activity"]
+    seconds = _idle_trim_seconds()
+    return {
+        "idle_trim_seconds": seconds,
+        "pending": pending and seconds > 0,
+        "next_trim_in_seconds": round(max(0.0, seconds - idle_seconds), 1) if pending and seconds > 0 and not busy else None,
+        **_trim_stats,
+    }
 
 
 def _evict_model_variants(runtime_key: RuntimeKey) -> None:
@@ -819,6 +1040,17 @@ def validate_input_lengths(model_id: str, texts: list[str], settings: dict[str, 
 
 
 def encode_texts(model_id: str, texts: list[str], settings: dict[str, Any] | None = None) -> EncodeResult:
+    _begin_activity()
+    on_cuda = True  # a failed call may have run passes on CUDA; trim_memory is a no-op without CUDA
+    try:
+        result = _encode_texts(model_id, texts, settings)
+        on_cuda = result.backend == "pytorch" and result.device.startswith("cuda")
+        return result
+    finally:
+        _end_activity(on_cuda)
+
+
+def _encode_texts(model_id: str, texts: list[str], settings: dict[str, Any] | None = None) -> EncodeResult:
     request_started = time.perf_counter()
     normalized_texts = [str(text or "") for text in texts]
     if not normalized_texts:
@@ -879,6 +1111,22 @@ def encode_inputs(
     extra VRAM stays within media_pass_budget_mb (token_counts from count_input_tokens size the LM cost). On CUDA
     each chunk needs free memory for its estimate plus a margin, and the cache is released afterwards.
     """
+    _begin_activity()
+    on_cuda = True  # see encode_texts
+    try:
+        result = _encode_inputs(model_id, inputs, settings, token_counts)
+        on_cuda = result.backend == "pytorch" and result.device.startswith("cuda")
+        return result
+    finally:
+        _end_activity(on_cuda)
+
+
+def _encode_inputs(
+    model_id: str,
+    inputs: Sequence[Any],
+    settings: dict[str, Any] | None,
+    token_counts: Sequence[int] | None,
+) -> EncodeResult:
     request_started = time.perf_counter()
     if not inputs:
         raise ValueError("inputs must not be empty")
@@ -988,6 +1236,7 @@ def get_runtime_status() -> dict[str, Any]:
             "compile_mode": key.compile_mode,
             "quantization": key.quantization,
             "cuda_graphs": value["cuda_graphs"].status() if value.get("cuda_graphs") is not None else None,
+            "compile": value.get("compile"),
             "max_seq_length": getattr(value.get("model"), "max_seq_length", None),
             "loaded_at": value.get("loaded_at"),
             "load_duration_ms": value.get("load_duration_ms"),
@@ -1000,6 +1249,7 @@ def get_runtime_status() -> dict[str, Any]:
     return {
         "loaded_models": loaded_models,
         "last_runtime_error": _last_runtime_error,
+        "idle_trim": idle_trim_status(),
         "resolved_runtime": {
             "backend": choice.backend,
             "device": choice.device,

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -133,22 +134,64 @@ def build_install_command(python_executable: str, variant: str) -> list[str]:
     ]
 
 
-def build_missing_packages_command(python_executable: str, variant: str) -> list[str] | None:
-    """Install only missing torch packages, pinned to the installed torch so it is not replaced."""
-    import importlib.metadata
+# Import name of each distribution: a dist-info whose module is gone (an interrupted uninstall) counts as missing.
+MODULE_BY_PACKAGE = {"torch": "torch", "torchvision": "torchvision", "torchaudio": "torchaudio", "triton-windows": "triton"}
 
-    missing: list[str] = []
-    torch_version: str | None = None
-    for package in TORCH_PACKAGES:
-        try:
-            version = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            missing.append(package)
-            continue
-        if package == "torch":
-            torch_version = version
+_PROBE_SCRIPT = """
+import importlib.metadata as metadata, importlib.util as util, json, sys
+found = {}
+for package, module in json.loads(sys.argv[1]).items():
+    try:
+        version = metadata.version(package)
+    except metadata.PackageNotFoundError:
+        version = None
+    found[package] = version if version and util.find_spec(module) is not None else None
+print(json.dumps(found))
+"""
+
+
+def installed_packages(python_executable: str, packages: Iterable[str]) -> dict[str, str | None] | None:
+    """Installed version per package in the TARGET interpreter (None = missing); None if it cannot be asked.
+
+    Checked in python_executable, not in the interpreter running this script: start.bat passes the venv python
+    explicitly, and a check against the wrong environment reported a torchvision-less venv as complete.
+    """
+    wanted = {package: MODULE_BY_PACKAGE.get(package, package) for package in packages}
+    try:
+        completed = subprocess.run(
+            [python_executable, "-I", "-c", _PROBE_SCRIPT, json.dumps(wanted)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    lines = completed.stdout.strip().splitlines() if completed.returncode == 0 else []
+    try:
+        found = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return None
+    return {package: found.get(package) for package in wanted} if isinstance(found, dict) else None
+
+
+def build_missing_packages_command(
+    python_executable: str,
+    variant: str,
+    installed: dict[str, str | None] | None = None,
+) -> list[str] | None:
+    """Install only missing torch packages, pinned to the installed torch so it is not replaced."""
+    if installed is None:
+        installed = installed_packages(python_executable, TORCH_PACKAGES)
+    if installed is None:
+        print(
+            "[Torch Install] Warning: could not query the target Python; letting pip install every torch package.",
+            flush=True,
+        )
+        installed = {}
+    missing = [package for package in TORCH_PACKAGES if not installed.get(package)]
     if not missing:
         return None
+    torch_version = installed.get("torch")
     index_url = PYTORCH_INDEX_BY_VARIANT[variant]
     pinned: list[str] = []
     if torch_version and "torch" not in missing:
@@ -163,18 +206,7 @@ def build_missing_packages_command(python_executable: str, variant: str) -> list
 
 
 def _installed_version(python_executable: str, package: str) -> str | None:
-    # stdout only (run_command merges stderr, where warnings could end up as the "version").
-    try:
-        completed = subprocess.run(
-            [python_executable, "-I", "-c", f"import importlib.metadata as m; print(m.version({package!r}))"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    lines = completed.stdout.strip().splitlines() if completed.returncode == 0 else []
-    return lines[-1].strip() if lines else None
+    return (installed_packages(python_executable, [package]) or {}).get(package)
 
 
 def triton_windows_spec(torch_version: str) -> str | None:
@@ -239,7 +271,8 @@ def main() -> int:
     parser.add_argument(
         "--only-missing",
         action="store_true",
-        help="Only install torch packages that are missing, keeping the installed torch version",
+        help="Only install what is missing of torch, torchvision, torchaudio and (Windows CUDA) triton-windows, "
+        "keeping the installed torch version",
     )
     args = parser.parse_args()
 

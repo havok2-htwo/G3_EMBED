@@ -106,7 +106,8 @@ Image, audio and video inputs are objects in the same list (see [Image, Audio an
 
 - `too_long_policy` ("Texts Over Token Limit"): `reject` (default) answers HTTP 400 `input_too_long` when any text, including its prompt and special tokens, exceeds the token limit; `truncate` cuts it silently. Requests can override this with `"truncate": true/false`. Oversized texts are rejected before batching, so they never fail other clients' requests.
 - `max_seq_length` ("Max Tokens / Text"): token limit per text. `0` uses the model default (EmbeddingGemma 2 and Qwen3: 4096, others: their native limit). Values above a model's limit are clamped (E5: 512, EmbeddingGemma 2: 8192).
-- `encode_batch_size` ("GPU Batch Size"): texts per forward pass at the full token window. `0` uses the model default (EmbeddingGemma 2: 4, Qwen3: 2, others: `batch_max_texts`). `batch_max_texts` / `batch_max_chars` only control how queued requests are merged.
+- `encode_batch_size` ("GPU Batch Size"): texts per forward pass at the full token window. `0` uses the model default (EmbeddingGemma 2: 4, Qwen3: 2, others: `batch_max_texts`). `batch_max_texts` / `batch_max_chars` only control how queued requests are merged. Bigger is not faster: on an RTX 5090 EmbeddingGemma 2 is fastest at 4; 8 and 16 were slower for every workload (512-token chunks 305 / 266 vs 327 per second, a mixed document batch 115 / 79 vs 133 texts/s) while the process peak grew from 5.3 to 7.6 / 12.3 GB. 2 keeps ~91 % of the batch-4 ingestion throughput at a 4.1 GB peak.
+- `idle_trim_seconds` ("Idle Trim", default 5, 0-3600, `0` = off): this many seconds after the last text or media request finished, cached CUDA memory goes back to the driver (`torch.cuda.empty_cache()` on a background thread that holds every model's encode lock, so it never overlaps a pass). Without it a process keeps the peak of its largest pass reserved for good (EmbeddingGemma 2 at batch 4: 5.3 GB instead of 3.0 GB). The CUDA graph pool stays. `/api/admin/system` shows the state under `runtime.idle_trim`.
 - `encode_token_batching` ("Pack texts by tokens", default on): forward passes are packed by padded tokens instead of a fixed text count. The budget is `encode_batch_size` x token window (EmbeddingGemma 2: 4 x 4096 = 16384 tokens), at most 128 texts per pass, longest texts first. Full-window texts still run 4 per pass, so peak VRAM stays at the old worst case, while short texts share one pass. Measured with EmbeddingGemma 2, `full` compile, RTX 4090: 512 texts of ~190 chars 3.0 s -> 0.16 s, 256 x 1k chars 1.5 s -> 0.26 s, 48 mixed 265 -> 106 ms (see the table under [CUDA graphs](#cuda-graphs)). Embeddings differ from fixed batches only by bf16 padding noise (cosine >= 0.9997). Off restores the fixed `encode_batch_size`.
 - `quantization`: `none`, `int8` or `nf4` via bitsandbytes. Applied only to Qwen3 models on PyTorch CUDA; ignored for other models.
 
@@ -122,19 +123,19 @@ Measured on an RTX 4090 (peak PyTorch allocation; add ~0.5 GB CUDA context). Ret
 | Qwen3 8B NF4 | 5.5 GB | 7k | 97.3 | 67.8 |
 | Qwen3 8B BF16 | 15.1 GB | 7.7k | 97.4 | 67.9 |
 
-At 4096 tokens Qwen3 is saturated at batch 1-2 and EmbeddingGemma 2 at batch 4; larger GPU batches only add VRAM. Embedding cosine vs. BF16: INT8 ~0.998, NF4 ~0.97-0.98.
+At 4096 tokens Qwen3 is saturated at batch 1-2 and EmbeddingGemma 2 at batch 4; larger GPU batches only add VRAM (and on an RTX 5090 lose throughput). The table shows PyTorch allocations; the whole process (CUDA context, model, graph pool, pass) measured on an RTX 5090 with CUDA graphs: EmbeddingGemma 2 3.0 GB idle, 3.6 GB at 4096 tokens batch 1, 5.3 GB at batch 4. Embedding cosine vs. BF16: INT8 ~0.998, NF4 ~0.97-0.98.
 
 ## Settings Presets
 
 The Settings panel has a "Presets" block: choose a preset, "Load into form" fills the settings form (nothing changes until Save Settings), "Save as preset" stores the current form under a name, "Delete preset" removes a saved one. Built-in GPU tiers, named identically in every G3 service and read-only:
 
-| Tier | Machine | GPU |
-|---|---|---|
-| `32GB VRAM` | RTX 5090, all G3 services on one card (whole-card peak <= 30 GB) | unchanged |
-| `24GB VRAM` | RTX 4090, all G3 services on one card (whole-card peak <= 23 GB) | unchanged |
-| `24+8 VRAM` | 3090 (24 GB) + 2070S (8 GB), EMBED on the 3090 next to RERANK | the card with ~24 GB, wherever it sits |
+| Tier | Machine | GPU | `encode_batch_size` | Process VRAM idle / peak |
+|---|---|---|---|---|
+| `32GB VRAM` | RTX 5090, all G3 services on one card (whole-card peak <= 30 GB) | unchanged | 4 | about 3.0 / 5.3 GB |
+| `24GB VRAM` | RTX 4090, all G3 services on one card (whole-card peak <= 23 GB) | unchanged | 2 | about 3.0 / 4.1 GB |
+| `24+8 VRAM` | 3090 (24 GB) + 2070S (8 GB), EMBED on the 3090 next to RERANK | the card with ~24 GB, wherever it sits | 2 | about 3.0 / 4.1 GB |
 
-There is no `8+24 VRAM` tier for EMBED. The tier values are currently the service defaults; measured values follow. Presets store only runtime, VRAM, batching, precision and device settings (`PRESET_KEYS` in `backend/genesis_embed_server_presets.py`), never the cache path or the Hugging Face token. Saved presets live in `logs/genesis_embed_presets.json`. API: see `API_DOCUMENTATION.md`.
+All tiers: EmbeddingGemma 2, `precision` auto (bf16), `quantization` none, `compile_mode` off, `cuda_graphs` on, `encode_token_batching` on, `max_seq_length` 0 (4096), `idle_trim_seconds` 5; the batching and media keys keep their defaults. The VRAM figures were measured on the RTX 5090 (process VRAM from nvidia-smi; the peak is full-window ingestion, which the token budget caps whatever a request holds; media passes stay below it). Batch 2 gives ~91 % of the batch-4 ingestion throughput for 1.2 GB less; CUDA graphs cost ~0.95 GB resident for 5x faster queries (5.5 vs 27.5 ms). `compile_mode` stays off: on the measuring box torch.compile fell back to eager. The idle trim brings the process back to the idle figure 5 s after the last request. On the 3090 the throughput is lower than on the 5090; the VRAM figures should carry over. There is no `8+24 VRAM` tier for EMBED: the 2070S (Turing) has no bf16, and `auto` would run the bf16-trained EmbeddingGemma 2 in fp16. Presets store only runtime, VRAM, batching, precision and device settings (`PRESET_KEYS` in `backend/genesis_embed_server_presets.py`), never the cache path or the Hugging Face token. Saved presets live in `logs/genesis_embed_presets.json`. API: see `API_DOCUMENTATION.md`.
 
 ## Query and Document Prompts
 
@@ -251,7 +252,7 @@ How a media request runs:
 - After every request that ran media on CUDA, the CUDA cache is released (`torch.cuda.empty_cache()`) so reserved memory goes back to the other services. A successful pass skips `gc.collect()`: its tensors are already freed, and a full collection in a process holding `torch.compile` state took 0.3-1 s per request (1 image 419 -> 80-113 ms, 30 s audio 448 -> 98-116 ms). When a pass fails, `gc.collect()` runs and the cache is released only after the failed pass's tensors are freed, so its memory is returned too.
 - All passes share the per-model encode lock, so only one forward pass runs at a time.
 
-The budget covers media passes only. Text keeps `encode_batch_size` (EmbeddingGemma 2 default 4: about 1.9 GB above the loaded model at 4 x 4096 tokens, see the last row).
+The budget covers media passes only. Text keeps `encode_batch_size` (EmbeddingGemma 2 default 4: about 1.9 GB above the loaded model at 4 x 4096 tokens, see the last row; 5.3 GB for the whole process on an RTX 5090). The idle trim (`idle_trim_seconds`) returns a text pass's working set 5 s after the last request; media requests release it right away.
 
 Decoded images and frames stay in CPU RAM until the request finishes, downscaled to at most about 2.6 (images) or 1.3 (frames) megapixels: under 8 MB of RGB each, per concurrent media request.
 
@@ -272,6 +273,8 @@ For multimodal models (EmbeddingGemma 2), `full` compiles only the language mode
 
 Compilation uses `dynamic=True`, so varying text lengths and batch sizes do not trigger recompiles, and it runs as a warmup while the model loads (covering short/long and padded/unpadded batches), not on the first request. A rare remaining input variant may still compile once on first use. Graphs that fail to compile fall back to eager.
 
+torch itself falls back silently, so the warmup checks dynamo's counters: when frames failed and no graph compiled, the log says `torch.compile NOT effective, the model runs eager` with the first error, and `loaded_models[].compile` in the runtime status (dashboard row "Compile") reports `effective: false` with the reason. Seen on Windows when Triton cannot build its C helper: both modes then run eager, and `full` spends ~2 minutes on a useless warmup.
+
 At server start the default model is preloaded in the background when it is already downloaded, so a long `full` warmup does not land on the first request. `/health` stays responsive meanwhile; embedding requests wait until the model is ready. Compile is skipped for bitsandbytes-quantized models and when Triton is missing.
 
 ## CUDA graphs
@@ -279,7 +282,7 @@ At server start the default model is preloaded in the background when it is alre
 `cuda_graphs` (default on; EmbeddingGemma 2 on PyTorch CUDA in bf16/fp16 only, other models ignore it): short text passes replay captured CUDA graphs instead of launching each kernel from Python. A short query is launch-bound on Windows: about 1.8 ms of GPU work but 15-30 ms of CPU time launching kernels.
 
 - Buckets: up to 512 tokens (the sliding window) x 1-128 texts, at most 4096 padded tokens per graph, 38 graphs. Inputs are padded to the next bucket with padded keys masked out; only the real rows and tokens are returned. Longer passes, media and anything else run the normal (compiled) forward.
-- Captured once at model load (largest bucket first, one shared memory pool; a few MB above the compiled model's own reserve, budget 1 GB). With `compile_mode=full` the capture adds about 1.5-2.5 minutes to the load (the graph input path is compiled once more); without compile it takes about 9 s. A failed capture logs a line and the model runs without graphs.
+- Captured once at model load (largest bucket first, one shared memory pool, about 650 MB on an RTX 5090, budget 1 GB; a compile warmup's cache is released first). The reported `memory_mb` is the pool's own reserved size (after a compile warmup it used to read 0 MB). With `compile_mode=full` the capture adds about 1.5-2.5 minutes to the load (the graph input path is compiled once more); without compile it takes about 9 s. A failed capture logs a line and the model runs without graphs.
 - Outputs match the normal forward up to bf16 padding noise (cosine >= 0.9999).
 
 Warm `encode_texts` latency, EmbeddingGemma 2, `compile_mode=full`, RTX 4090 (before = fixed batch 4 with `gc.collect()` after media; the middle column is token batching and the `to()`/`eval()` fast path without graphs):
@@ -301,6 +304,8 @@ Warm `encode_texts` latency, EmbeddingGemma 2, `compile_mode=full`, RTX 4090 (be
 sentence-transformers calls `model.to(device)` and `model.eval()` on every `encode()`; each walks all ~1500 modules of EmbeddingGemma 2 (~11 ms on a Ryzen 5900X). Both return early now when nothing would change.
 
 Triton: Linux CUDA builds of PyTorch include it. On Windows, `tools/install_torch_backend.py` installs the `triton-windows` release that matches the installed torch minor version (torch 2.11 -> triton 3.7). Set `GENESIS_SKIP_TRITON_WINDOWS=1` to skip it.
+
+`start.bat` runs `tools/install_torch_backend.py --only-missing` on every start: it asks the venv's Python which of torch, torchvision, torchaudio and (Windows CUDA) triton-windows are installed and importable, and installs only the missing ones, pinned to the installed torch build. EmbeddingGemma 2 needs torchvision (its processor fails with "requires the Torchvision library" otherwise).
 
 ## OpenVINO
 

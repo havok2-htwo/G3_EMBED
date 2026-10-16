@@ -86,6 +86,7 @@ const emptySettings: AdminSettings = {
   compile_mode: "off",
   cuda_graphs: true,
   warmup_on_load: false,
+  idle_trim_seconds: 5,
   huggingface_token: "",
   image_inputs_enabled: true,
   audio_inputs_enabled: true,
@@ -157,6 +158,34 @@ function formatValue(value: number | null | undefined, suffix = "") {
   }
   const maximumFractionDigits = Number.isInteger(value) ? 0 : 2;
   return `${new Intl.NumberFormat(NUMBER_LOCALE, { maximumFractionDigits }).format(value)}${suffix}`;
+}
+
+// Per loaded model with compile_mode != off: whether dynamo really compiled (it falls back to eager silently).
+function compileSummary(models: Array<Record<string, unknown>>) {
+  const parts = models.flatMap((model) => {
+    const status = model.compile as { effective?: boolean; graphs?: number; reason?: string | null } | null | undefined;
+    if (!status) {
+      return [];
+    }
+    const name = String(model.model_id ?? "model");
+    if (!status.effective) {
+      return [`${name}: NOT effective (eager)${status.reason ? `, ${status.reason}` : ""}`];
+    }
+    return [`${name}: ${String(model.compile_mode)} (${formatValue(status.graphs ?? 0)} graphs)`];
+  });
+  return parts.length ? parts.join("; ") : "off";
+}
+
+function idleTrimSummary(idle: RuntimeInfo["idle_trim"]) {
+  if (!idle) {
+    return "n/a";
+  }
+  if (!idle.idle_trim_seconds) {
+    return "off";
+  }
+  const next = idle.next_trim_in_seconds !== null ? `, next in ${formatValue(idle.next_trim_in_seconds)} s` : "";
+  const freed = idle.last_freed_mb !== null ? `, last freed ${formatValue(idle.last_freed_mb)} MB` : "";
+  return `after ${idle.idle_trim_seconds} s, ${formatValue(idle.trims)} trims${freed}${next}`;
 }
 
 function formatFixed(value: number | null | undefined, digits = 2, suffix = "") {
@@ -1094,6 +1123,10 @@ export default function App() {
               <span>Max Tokens / Text (0 = model default)</span>
               <input type="number" min={0} step={256} value={settingsForm.max_seq_length} onChange={(event) => updateSetting("max_seq_length", Number(event.target.value))} />
             </label>
+            <label title="Seconds after the last request before the pass working set (cached CUDA memory) goes back to the driver; CUDA graphs stay.">
+              <span>Idle Trim (s, 0 = off)</span>
+              <input type="number" min={0} max={3600} value={settingsForm.idle_trim_seconds} onChange={(event) => updateSetting("idle_trim_seconds", Number(event.target.value))} />
+            </label>
             <label>
               <span>Texts Over Token Limit</span>
               <select value={settingsForm.too_long_policy} onChange={(event) => updateSetting("too_long_policy", event.target.value)}>
@@ -1303,6 +1336,8 @@ export default function App() {
             <div><span>NVIDIA</span><strong>{runtime?.system.nvidia_gpus?.join(", ") || "n/a"}</strong></div>
             <div><span>NPU</span><strong>{runtime?.system.windows_npu_devices?.join(", ") || "n/a"}</strong></div>
             <div><span>Loaded Models</span><strong>{formatValue(runtime?.loaded_models.length ?? 0)}</strong></div>
+            <div><span>Compile</span><strong>{compileSummary(runtime?.loaded_models ?? [])}</strong></div>
+            <div><span>Idle Trim</span><strong>{idleTrimSummary(runtime?.idle_trim)}</strong></div>
             <div><span>Last Runtime Error</span><strong>{runtime?.last_runtime_error ?? "none"}</strong></div>
           </div>
         </section>

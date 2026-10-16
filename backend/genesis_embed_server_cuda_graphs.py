@@ -47,6 +47,22 @@ def graph_buckets(max_tokens: int = MAX_GRAPH_TOKENS) -> list[tuple[int, int]]:
     return sorted(pairs, key=lambda pair: (pair[0] * pair[1], pair[1]), reverse=True)
 
 
+def pool_reserved_bytes(segments: Sequence[dict[str, Any]], pool_id: tuple[int, int], device_index: int | None) -> int | None:
+    """Sum of the allocator segments (torch.cuda.memory_snapshot) that belong to one graph pool on one device.
+
+    Measured per pool rather than as a reserved-memory delta: blocks cached before the capture (a compile warmup)
+    or released during it made the delta read 0 MB. None when the snapshot carries no pool ids.
+    """
+    if any("segment_pool_id" not in segment for segment in segments):
+        return None
+    wanted = tuple(pool_id)
+    return sum(
+        int(segment.get("total_size") or 0)
+        for segment in segments
+        if tuple(segment["segment_pool_id"]) == wanted and (device_index is None or segment.get("device") == device_index)
+    )
+
+
 def supported(inner_model: Any) -> tuple[bool, str]:
     """Whether the inner transformers model is one this module knows how to capture."""
     import torch
@@ -125,12 +141,33 @@ class TextGraphRunner:
         out.copy_(hidden)
         return out
 
+    def pool_bytes(self) -> int | None:
+        """Bytes reserved by the graphs' private memory pool on this device; None if the allocator cannot say."""
+        try:
+            import torch
+
+            try:
+                segments = torch.cuda.memory_snapshot(include_traces=False)
+            except TypeError:  # older torch: no include_traces
+                segments = torch.cuda.memory_snapshot()
+        except Exception:
+            return None
+        return pool_reserved_bytes(segments, tuple(self._pool), self.device.index)
+
+    def _graph_memory(self, reserved_before: int) -> int:
+        import torch
+
+        pool = self.pool_bytes()
+        if pool is not None:
+            return pool
+        # Fallback: the process-local reserved delta (mem_get_info also moves with the other services on the GPU).
+        return max(0, torch.cuda.memory_reserved(self.device) - reserved_before)
+
     def capture(self, buckets: Sequence[tuple[int, int]] | None = None) -> None:
         """Capture every bucket (largest first) until the VRAM budget is reached. Call on the loading thread."""
         import torch
 
         started = time.perf_counter()
-        # Process-local (mem_get_info also moves with the other services on the GPU).
         reserved_before = torch.cuda.memory_reserved(self.device) - self.memory_bytes
         dtype = next(self.inner_model.parameters()).dtype
         with torch.inference_mode():
@@ -162,7 +199,7 @@ class TextGraphRunner:
                 graph.replay()
                 self._stream.synchronize()
                 self.graphs[(rows, tokens)] = graph
-                self.memory_bytes = max(0, torch.cuda.memory_reserved(self.device) - reserved_before)
+                self.memory_bytes = self._graph_memory(reserved_before)
         torch.cuda.synchronize(self.device)
         self.capture_ms = (time.perf_counter() - started) * 1000
 

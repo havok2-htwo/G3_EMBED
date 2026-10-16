@@ -42,6 +42,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "compile_mode": "off",
     "cuda_graphs": True,
     "warmup_on_load": False,
+    # Seconds after the last text or media pass before cached, unused CUDA memory goes back to the driver (0 = off).
+    "idle_trim_seconds": 5,
     "huggingface_token": "",
     **MEDIA_TOGGLE_SETTINGS,
     **{name: default for name, (default, _, _) in MEDIA_LIMIT_SETTINGS.items()},
@@ -121,6 +123,12 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "compile_mode": _valid_option(COMPILE_OPTIONS, source.get("compile_mode"), "off"),
         "cuda_graphs": bool(source.get("cuda_graphs", DEFAULT_SETTINGS["cuda_graphs"])),
         "warmup_on_load": bool(source.get("warmup_on_load", DEFAULT_SETTINGS["warmup_on_load"])),
+        "idle_trim_seconds": _clamp_int(
+            source.get("idle_trim_seconds", DEFAULT_SETTINGS["idle_trim_seconds"]),
+            minimum=0,
+            maximum=3600,
+            default=DEFAULT_SETTINGS["idle_trim_seconds"],
+        ),
         "huggingface_token": str(source.get("huggingface_token", "")).strip(),
         **{name: bool(source.get(name, default)) for name, default in MEDIA_TOGGLE_SETTINGS.items()},
         **{

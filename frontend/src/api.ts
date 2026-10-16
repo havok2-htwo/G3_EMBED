@@ -22,6 +22,8 @@ export type AdminSettings = {
   compile_mode: string;
   cuda_graphs: boolean;
   warmup_on_load: boolean;
+  // Seconds after the last pass before cached CUDA memory is returned to the driver (0 = off).
+  idle_trim_seconds: number;
   huggingface_token: string;
   // Media inputs (image / audio / video); the backend clamps every limit to its hard range.
   image_inputs_enabled: boolean;
@@ -68,6 +70,14 @@ export type ManagedModel = {
 export type RuntimeInfo = {
   loaded_models: Array<Record<string, unknown>>;
   last_runtime_error: string | null;
+  idle_trim?: {
+    idle_trim_seconds: number;
+    pending: boolean;
+    next_trim_in_seconds: number | null;
+    trims: number;
+    last_trim_at: number | null;
+    last_freed_mb: number | null;
+  };
   resolved_runtime: {
     backend: string;
     device: string;

@@ -396,6 +396,12 @@ Deletes a client API key.
 
 Returns current settings, UI options, model cache state, and runtime status.
 
+Runtime status fields (also in `GET /api/admin/system`):
+
+- `loaded_models[].compile`: `null` with `compile_mode` `off`, else `{"effective", "graphs", "failed_frames", "reason"}`. `effective: false` means dynamo fell back to eager during the load warmup (e.g. Triton cannot build its C helper on Windows) or compile was not applied; `reason` names the first error. The model still works, at eager speed.
+- `loaded_models[].cuda_graphs.memory_mb`: the reserved size of the graphs' private memory pool.
+- `idle_trim`: `{"idle_trim_seconds", "pending", "next_trim_in_seconds", "trims", "last_trim_at", "last_freed_mb"}`.
+
 ### `PUT /api/admin/settings`
 
 Updates settings:
@@ -416,9 +422,10 @@ Updates settings:
 - `quantization` (`none`, `int8`, `nf4`; PyTorch CUDA only)
 - `compile_mode` (`off`, `regional`, `full`)
 - `warmup_on_load`
+- `idle_trim_seconds` (default 5, 0-3600; `torch.cuda.empty_cache()` this many seconds after the last text or media request finished, `0` = off; CUDA graph pools stay)
 - `huggingface_token`
 
-Optional fields (`encode_batch_size`, `max_seq_length`, `too_long_policy`, `quantization` and all media settings) keep their current value when omitted from the payload, so an older client that does not know a field never resets it.
+Optional fields (`encode_batch_size`, `max_seq_length`, `too_long_policy`, `quantization`, `idle_trim_seconds` and all media settings) keep their current value when omitted from the payload, so an older client that does not know a field never resets it.
 
 Media settings (out-of-range values are clamped to `min-max`):
 
@@ -446,7 +453,9 @@ Built-in tiers (names identical across the G3 services, read-only):
 - `24GB VRAM`: RTX 4090, every G3 service on one card (whole-card peak <= 23 GB)
 - `24+8 VRAM`: 3090 (24 GB) + 2070S (8 GB) box, EMBED on the 24 GB card. Its `values.gpu_device` is the CUDA card whose total memory is within 2 GiB of 24 GB, wherever it sits on this machine; with no such card `gpu_device` is left out and `note` says why.
 
-Single-card tiers never set `gpu_device`. There is no `8+24 VRAM` tier for EMBED (it runs on the 3090 next to RERANK).
+Single-card tiers never set `gpu_device`. There is no `8+24 VRAM` tier for EMBED (it runs on the 3090 next to RERANK; the 2070S has no bf16).
+
+Tier values, measured on an RTX 5090 (EmbeddingGemma 2 bf16, CUDA graphs, `compile_mode` off, window 4096, idle trim 5 s): `32GB VRAM` `encode_batch_size` 4, about 3.0 GB idle and 5.3 GB peak process VRAM; `24GB VRAM` and `24+8 VRAM` `encode_batch_size` 2, about 3.0 GB idle and 4.1 GB peak (~91 % of the batch-4 ingestion throughput). Every tier lists every preset key except `gpu_device`.
 
 ```json
 {
@@ -464,7 +473,7 @@ Single-card tiers never set `gpu_device`. There is no `8+24 VRAM` tier for EMBED
 }
 ```
 
-Preset keys (everything else is dropped): `default_model`, `execution_target`, `gpu_device`, `backend_override`, `precision`, `quantization`, `compile_mode`, `cuda_graphs`, `warmup_on_load`, `batching_enabled`, `batch_wait_time_ms`, `batch_max_texts`, `batch_max_chars`, `encode_batch_size`, `encode_token_batching`, `max_seq_length`, `media_pass_budget_mb`, `max_concurrent_media_requests`. The cache path, the Hugging Face token, `too_long_policy` and the per-request media limits are never stored in a preset.
+Preset keys (everything else is dropped): `default_model`, `execution_target`, `gpu_device`, `backend_override`, `precision`, `quantization`, `compile_mode`, `cuda_graphs`, `warmup_on_load`, `batching_enabled`, `batch_wait_time_ms`, `batch_max_texts`, `batch_max_chars`, `encode_batch_size`, `encode_token_batching`, `max_seq_length`, `media_pass_budget_mb`, `max_concurrent_media_requests`, `idle_trim_seconds`. The cache path, the Hugging Face token, `too_long_policy` and the per-request media limits are never stored in a preset.
 
 ### `PUT /api/admin/settings/presets/{name}`
 

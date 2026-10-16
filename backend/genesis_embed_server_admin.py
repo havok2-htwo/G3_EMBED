@@ -58,6 +58,7 @@ class AdminSettingsPayload(BaseModel):
     compile_mode: str
     cuda_graphs: bool = True
     warmup_on_load: bool
+    idle_trim_seconds: int = 5
     huggingface_token: str
     # Optional so older frontends keep working; an omitted field keeps its current value (see PUT below).
     image_inputs_enabled: bool = True

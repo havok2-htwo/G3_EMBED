@@ -32,6 +32,36 @@ def test_builtin_values_are_valid_settings(name):
     assert {key: normalized[key] for key in values} == values, "a built-in value would be clamped or rejected"
 
 
+def test_builtin_values_are_the_measured_tier_values():
+    # Measured on an RTX 5090 (see the BUILT-IN TIER VALUES comment): only the GPU batch size differs per tier.
+    common = {
+        "default_model": "google/embeddinggemma-2",
+        "precision": "auto",
+        "quantization": "none",
+        "compile_mode": "off",
+        "cuda_graphs": True,
+        "encode_token_batching": True,
+        "max_seq_length": 0,
+        "idle_trim_seconds": 5,
+    }
+    batch_sizes = {"32GB VRAM": 4, "24GB VRAM": 2, "24+8 VRAM": 2}
+    for name, batch_size in batch_sizes.items():
+        values = presets.BUILTIN_PRESETS[name]["values"]
+        assert {key: values[key] for key in common} == common, name
+        assert values["encode_batch_size"] == batch_size, name
+        assert set(values) == set(presets.PRESET_KEYS) - {"gpu_device"}, f"{name} leaves a preset key to chance"
+    assert presets.BUILTIN_PRESETS["24+8 VRAM"]["target_vram_gb"] == 24
+    assert "8+24 VRAM" not in presets.BUILTIN_PRESETS
+
+
+@pytest.mark.parametrize(("name", "idle_gb", "peak_gb"), [("32GB VRAM", "3.0", "5.3"), ("24GB VRAM", "3.0", "4.1"), ("24+8 VRAM", "3.0", "4.1")])
+def test_builtin_descriptions_state_the_measured_vram(name, idle_gb, peak_gb):
+    description = presets.BUILTIN_PRESETS[name]["description"]
+    assert f"{idle_gb} GB idle" in description and f"{peak_gb} GB peak" in description
+    assert "measured on the RTX 5090" in description
+    assert "not measured" not in description
+
+
 def test_preset_keys_hold_no_secrets_or_paths():
     for key in ("huggingface_token", "model_cache_path"):
         assert key not in presets.PRESET_KEYS

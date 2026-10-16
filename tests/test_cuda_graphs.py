@@ -36,6 +36,21 @@ def test_graph_buckets_largest_first_and_capped():
     assert len(buckets) == len(set(buckets))
 
 
+def test_pool_reserved_bytes_counts_only_the_graph_pool_on_its_device():
+    segments = [
+        {"device": 0, "segment_pool_id": (0, 0), "total_size": 900 << 20},  # ordinary cache (e.g. a compile warmup)
+        {"device": 0, "segment_pool_id": (1, 7), "total_size": 400 << 20},
+        {"device": 0, "segment_pool_id": (1, 7), "total_size": 250 << 20},
+        {"device": 1, "segment_pool_id": (1, 7), "total_size": 64 << 20},
+        {"device": 0, "segment_pool_id": (1, 8), "total_size": 32 << 20},
+    ]
+    assert cuda_graphs.pool_reserved_bytes(segments, (1, 7), 0) == 650 << 20
+    assert cuda_graphs.pool_reserved_bytes(segments, (1, 7), None) == 714 << 20
+    assert cuda_graphs.pool_reserved_bytes([], (1, 7), 0) == 0
+    # A snapshot without pool ids: the caller falls back to the reserved-memory delta.
+    assert cuda_graphs.pool_reserved_bytes([{"device": 0, "total_size": 1}], (1, 7), 0) is None
+
+
 def test_supported_rejects_non_gemma_and_cpu():
     ok, reason = cuda_graphs.supported(torch.nn.Linear(2, 2))
     assert not ok and reason
@@ -148,8 +163,8 @@ def test_graphs_match_eager(gemma):
     runner.capture([(16, 64), (4, 32), (1, 16), (4, 64), (1, 64)])
     runner.install()
     try:
-        # memory_bytes is the reserved-memory delta; graph pools may reuse cached blocks, so it can be 0.
-        assert runner.memory_bytes >= 0 and len(runner.graphs) == 5
+        # memory_bytes is the graph pool's own segments, so it is never 0 once a graph is captured.
+        assert runner.memory_bytes > 0 and runner.memory_bytes == runner.pool_bytes() and len(runner.graphs) == 5
         for size in (1, 4, 12):
             graphed = _encode(gemma, texts, size)
             # Normalized in bf16 by sentence-transformers (norms off by up to ~0.5%): renormalize first.
