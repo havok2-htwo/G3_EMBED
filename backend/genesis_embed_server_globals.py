@@ -6,6 +6,11 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Dict
 
+# Number CUDA devices like nvidia-smi / NVML (PCI bus order), so gpu_device "cuda:1" is the card nvidia-smi calls
+# GPU 1. CUDA's default order is "fastest first", which differs on mixed boxes (e.g. 3090 + 2070S). Must be set
+# before torch initialises CUDA; an explicit environment value wins.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = PROJECT_ROOT / "logs"
 SETTINGS_FILE = LOGS_DIR / "genesis_embed_settings.json"

@@ -6,6 +6,7 @@ export type AdminOption = {
 export type AdminSettings = {
   default_model: string;
   execution_target: string;
+  gpu_device: string;
   backend_override: string;
   model_cache_path: string;
   batching_enabled: boolean;
@@ -92,6 +93,7 @@ export type SettingsResponse = {
   options: {
     models: AdminOption[];
     execution_targets: AdminOption[];
+    gpu_devices: AdminOption[];
     backends: AdminOption[];
     precisions: AdminOption[];
     quantizations: AdminOption[];

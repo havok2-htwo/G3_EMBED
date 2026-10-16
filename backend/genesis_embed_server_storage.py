@@ -24,6 +24,7 @@ from .genesis_embed_server_globals import (
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "default_model": DEFAULT_MODEL_ID,
     "execution_target": "auto",
+    "gpu_device": "auto",
     "backend_override": "auto",
     "model_cache_path": ".\\models",
     "batching_enabled": True,
@@ -59,6 +60,15 @@ def _clamp_int(value: Any, *, minimum: int, maximum: int, default: int) -> int:
     return max(minimum, min(maximum, numeric))
 
 
+def normalize_gpu_device(value: Any) -> str:
+    """"auto" or "cuda:N" (N = nvidia-smi index). The index is not checked against the cards present here: a
+    settings file may come from another machine, and the runtime falls back to GPU 0 with a log line."""
+    text = str(value or "").strip().lower()
+    if text.startswith("cuda:") and text[5:].isdigit():
+        return f"cuda:{int(text[5:])}"
+    return "auto"
+
+
 def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     source = settings or {}
     default_model = str(source.get("default_model", DEFAULT_SETTINGS["default_model"])).strip()
@@ -68,6 +78,7 @@ def normalize_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "default_model": default_model,
         "execution_target": _valid_option(EXECUTION_TARGET_OPTIONS, source.get("execution_target"), "auto"),
+        "gpu_device": normalize_gpu_device(source.get("gpu_device")),
         "backend_override": _valid_option(BACKEND_OPTIONS, source.get("backend_override"), "auto"),
         "model_cache_path": str(source.get("model_cache_path", DEFAULT_SETTINGS["model_cache_path"])).strip(),
         "batching_enabled": bool(source.get("batching_enabled", DEFAULT_SETTINGS["batching_enabled"])),

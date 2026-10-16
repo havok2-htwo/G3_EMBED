@@ -66,6 +66,7 @@ const HISTORY_POINTS = 72;
 const emptySettings: AdminSettings = {
   default_model: "google/embeddinggemma-2",
   execution_target: "auto",
+  gpu_device: "auto",
   backend_override: "auto",
   model_cache_path: ".\\models",
   batching_enabled: true,
@@ -138,6 +139,7 @@ const mediaToggleFields: Array<{ key: "image_inputs_enabled" | "audio_inputs_ena
 const emptyOptions = {
   models: [] as AdminOption[],
   execution_targets: [] as AdminOption[],
+  gpu_devices: [] as AdminOption[],
   backends: [] as AdminOption[],
   precisions: [] as AdminOption[],
   quantizations: [] as AdminOption[],
@@ -908,6 +910,17 @@ export default function App() {
               <span>Target</span>
               <select value={settingsForm.execution_target} onChange={(event) => updateSetting("execution_target", event.target.value)}>
                 {settingsOptions.execution_targets.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <label title="Numbered like nvidia-smi. Switching reloads the model on the new card; the old card keeps the CUDA context (~0.5 GB) until restart.">
+              <span>GPU</span>
+              <select value={settingsForm.gpu_device} onChange={(event) => updateSetting("gpu_device", event.target.value)}>
+                {!(settingsOptions.gpu_devices ?? []).some((option) => option.value === settingsForm.gpu_device) ? (
+                  <option value={settingsForm.gpu_device}>{settingsForm.gpu_device}</option>
+                ) : null}
+                {(settingsOptions.gpu_devices ?? []).map((option) => (
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>

@@ -125,6 +125,7 @@ def detect_torch_devices() -> dict[str, Any]:
         "torch_version": None,
         "cuda_available": False,
         "cuda_devices": [],
+        "cuda_memory_mib": [],
         "xpu_available": False,
         "xpu_devices": [],
     }
@@ -137,6 +138,10 @@ def detect_torch_devices() -> dict[str, Any]:
             info["cuda_available"] = True
             info["cuda_devices"] = [
                 torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())
+            ]
+            info["cuda_memory_mib"] = [
+                round(torch.cuda.get_device_properties(index).total_memory / (1024 * 1024))
+                for index in range(torch.cuda.device_count())
             ]
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             info["xpu_available"] = True
@@ -192,6 +197,32 @@ def get_system_snapshot() -> dict[str, Any]:
     return payload
 
 
+def resolve_gpu_index(setting: Any, device_count: int) -> tuple[int, str | None]:
+    """gpu_device ("auto" | "cuda:N") -> CUDA index, plus a warning when the configured card is missing (then GPU 0)."""
+    text = str(setting or "auto").strip().lower()
+    if text.startswith("cuda:") and text[5:].isdigit():
+        index = int(text[5:])
+        if index < device_count:
+            return index, None
+        return 0, f"gpu_device '{text}' is not present ({device_count} CUDA device(s)); using cuda:0"
+    return 0, None
+
+
+def gpu_device_options(current: Any = None) -> list[dict[str, str]]:
+    """Choices for the GPU dropdown: Auto plus every CUDA device; a saved card that is missing stays listed."""
+    torch_info = get_system_snapshot()["torch"]
+    names = list(torch_info.get("cuda_devices") or [])
+    memory = list(torch_info.get("cuda_memory_mib") or [])
+    options = [{"label": "Auto (GPU 0)", "value": "auto"}]
+    for index, name in enumerate(names):
+        size = f" ({memory[index] / 1024:.0f} GB)" if index < len(memory) and memory[index] else ""
+        options.append({"label": f"GPU {index}: {name}{size}", "value": f"cuda:{index}"})
+    current_value = str(current or "").strip().lower()
+    if current_value.startswith("cuda:") and current_value not in {option["value"] for option in options}:
+        options.append({"label": f"{current_value} (not detected)", "value": current_value})
+    return options
+
+
 def resolve_runtime_choice(settings: dict[str, Any]) -> RuntimeChoice:
     target = str(settings.get("execution_target") or "auto").strip()
     backend_override = str(settings.get("backend_override") or "auto").strip()
@@ -201,7 +232,16 @@ def resolve_runtime_choice(settings: dict[str, Any]) -> RuntimeChoice:
     # Without optimum-intel, OpenVINO devices cannot run models; route Intel targets to PyTorch instead.
     openvino_devices = set(snapshot["openvino_devices"]) if openvino_available else set()
 
+    cuda_names = list(torch_info.get("cuda_devices") or [])
+    cuda_index, cuda_warning = resolve_gpu_index(settings.get("gpu_device"), len(cuda_names))
+    cuda_label = f"GPU {cuda_index}: {cuda_names[cuda_index]}" if cuda_index < len(cuda_names) else "CUDA"
+
     def choice(backend: str, device: str, label: str, source: str, detail: str) -> RuntimeChoice:
+        # Every CUDA choice runs on the card gpu_device selects (cuda:N, nvidia-smi numbering).
+        if backend == "pytorch" and device == "cuda":
+            device, label = f"cuda:{cuda_index}", cuda_label
+            if cuda_warning:
+                detail = f"{detail}; {cuda_warning}"
         return RuntimeChoice(backend=backend, device=device, device_label=label, source=source, detail=detail)
 
     if backend_override == "pytorch":

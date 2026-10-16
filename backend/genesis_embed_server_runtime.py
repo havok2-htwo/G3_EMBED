@@ -339,9 +339,25 @@ def _install_cuda_graphs(model: Any) -> Any:
     return runner
 
 
+def _bind_cuda_device(device: str) -> None:
+    """Make the selected card (gpu_device) this thread's current CUDA device.
+
+    The current device is per thread and 0 by default; graph pools and kernels launched without an explicit device
+    guard use it. Cheap when already bound; before CUDA is initialised set_device runs first, because asking for
+    current_device() would initialise on GPU 0.
+    """
+    import torch
+
+    index = torch.device(device).index or 0
+    if not torch.cuda.is_initialized() or torch.cuda.current_device() != index:
+        torch.cuda.set_device(index)
+
+
 def _load_model(runtime_key: RuntimeKey, settings: dict[str, Any], choice: RuntimeChoice) -> tuple[Any, float]:
     global _last_runtime_error
 
+    if _is_cuda_pytorch(choice):
+        _bind_cuda_device(choice.device)
     cached = _model_cache.get(runtime_key)
     if cached is not None:
         return cached["model"], 0.0

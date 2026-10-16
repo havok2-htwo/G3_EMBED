@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from statistics import mean
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
@@ -31,7 +31,7 @@ from .genesis_embed_server_globals import (
     history_lock,
     settings_lock,
 )
-from .genesis_embed_server_hardware import get_system_snapshot
+from .genesis_embed_server_hardware import get_system_snapshot, gpu_device_options
 from .genesis_embed_server_model_manager import delete_model_cache, list_model_statuses, queue_model_download
 from .genesis_embed_server_runtime import compare_vectors, encode_texts, get_runtime_status
 from .genesis_embed_server_storage import normalize_settings, save_settings
@@ -40,6 +40,8 @@ from .genesis_embed_server_storage import normalize_settings, save_settings
 class AdminSettingsPayload(BaseModel):
     default_model: str
     execution_target: str
+    # Optional: an older dashboard that does not send it keeps the stored GPU.
+    gpu_device: Optional[str] = None
     backend_override: str
     model_cache_path: str
     batching_enabled: bool
@@ -115,6 +117,7 @@ def _settings_options() -> Dict[str, List[Dict[str, str]]]:
     return {
         "models": MODEL_OPTIONS,
         "execution_targets": EXECUTION_TARGET_OPTIONS,
+        "gpu_devices": gpu_device_options(_serialize_settings().get("gpu_device")),
         "backends": BACKEND_OPTIONS,
         "precisions": PRECISION_OPTIONS,
         "quantizations": QUANTIZATION_OPTIONS,
