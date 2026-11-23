@@ -18,24 +18,8 @@ for path in (PROJECT_ROOT, TESTS_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-_REAL_LOGS_DIR = (PROJECT_ROOT / "logs").resolve()
-_real_write_text = Path.write_text
-
-
-def _write_text_outside_real_logs(self, *args, **kwargs):
-    if Path(self).resolve().parent == _REAL_LOGS_DIR:
-        return 0
-    return _real_write_text(self, *args, **kwargs)
-
-
-# Importing the backend creates AuthStore(PROJECT_ROOT), which rewrites logs/genesis_embed_secrets.json.
-# Tests never write the real logs/, so drop writes there while the backend is imported.
-Path.write_text = _write_text_outside_real_logs
-try:
-    from backend import genesis_embed_server_auth as auth  # noqa: E402
-finally:
-    Path.write_text = _real_write_text
-
+# The auth store is created lazily (get_auth_store), so importing the backend never writes the real logs/.
+from backend import genesis_embed_server_auth as auth  # noqa: E402
 from backend import genesis_embed_server_api as api  # noqa: E402
 from backend import genesis_embed_server_presets as presets  # noqa: E402
 from backend import genesis_embed_server_runtime as runtime  # noqa: E402
@@ -97,10 +81,13 @@ def isolated_state(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "SETTINGS_FILE", tmp_path / "genesis_embed_settings.json")
     monkeypatch.setattr(storage, "LOG_FILE", tmp_path / "embedding_log.jsonl")
     monkeypatch.setattr(presets, "PRESETS_FILE", tmp_path / "genesis_embed_presets.json")
-    monkeypatch.setattr(auth.get_auth_store(), "secrets_path", tmp_path / "genesis_embed_secrets.json")
+    # A fresh auth store under tmp_path/logs, created only when a test uses it.
+    monkeypatch.setattr(auth, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(auth, "_auth_store", None)
+    auth.login_rate_limiter.reset()
     logged: list[dict] = []
     monkeypatch.setattr(api, "log_embedding", logged.append)
-    monkeypatch.setattr(api, "authorize_api_key", lambda request: None)
+    monkeypatch.setattr(api, "authorize_api_request", lambda request: None)
     monkeypatch.setattr(api, "media_slots", api._MediaSlots())
     monkeypatch.setattr(runtime, "_model_cache", {})
     monkeypatch.setattr(runtime, "_standalone_tokenizers", runtime.OrderedDict())

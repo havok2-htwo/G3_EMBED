@@ -208,15 +208,47 @@ def resolve_gpu_index(setting: Any, device_count: int) -> tuple[int, str | None]
     return 0, None
 
 
+# torch cuda index -> nvidia-smi index. Card identity never changes while the process runs, so hits are cached.
+_NVML_INDEX_CACHE: dict[int, int] = {}
+
+
+def nvml_index_for_cuda(cuda_index: int) -> int | None:
+    """nvidia-smi number of the card behind torch's cuda:<n>, matched by UUID (g3_gpu). With
+    CUDA_VISIBLE_DEVICES the two numberings differ (on a 2070 SUPER + 3090 host the 3090 is cuda:0 but GPU 1)."""
+    if cuda_index in _NVML_INDEX_CACHE:
+        return _NVML_INDEX_CACHE[cuda_index]
+    try:
+        from .g3_gpu import gpu_for_cuda_index
+
+        gpu = gpu_for_cuda_index(cuda_index)
+    except Exception:
+        gpu = None
+    index = gpu.get("nvml_index") if gpu else None
+    if isinstance(index, int):
+        _NVML_INDEX_CACHE[cuda_index] = index
+        return index
+    return None
+
+
+def cuda_gpu_label(cuda_index: int, name: str) -> str:
+    """"GPU <nvidia-smi index> · <name without NVIDIA>", the label every G3 admin UI uses for a card."""
+    short = name.removeprefix("NVIDIA ").strip() or name
+    nvml_index = nvml_index_for_cuda(cuda_index)
+    return f"GPU {nvml_index} · {short}" if nvml_index is not None else f"cuda:{cuda_index} · {short}"
+
+
 def gpu_device_options(current: Any = None) -> list[dict[str, str]]:
-    """Choices for the GPU dropdown: Auto plus every CUDA device; a saved card that is missing stays listed."""
+    """Choices for the GPU dropdown: Auto plus every CUDA device this process sees (values stay cuda:N, the
+    labels use nvidia-smi numbering); a saved card that is missing stays listed."""
     torch_info = get_system_snapshot()["torch"]
     names = list(torch_info.get("cuda_devices") or [])
     memory = list(torch_info.get("cuda_memory_mib") or [])
-    options = [{"label": "Auto (GPU 0)", "value": "auto"}]
+    cards: list[dict[str, str]] = []
     for index, name in enumerate(names):
         size = f" ({memory[index] / 1024:.0f} GB)" if index < len(memory) and memory[index] else ""
-        options.append({"label": f"GPU {index}: {name}{size}", "value": f"cuda:{index}"})
+        cards.append({"label": f"{cuda_gpu_label(index, name)}{size}", "value": f"cuda:{index}"})
+    auto_label = f"Auto ({cards[0]['label']})" if cards else "Auto"
+    options = [{"label": auto_label, "value": "auto"}, *cards]
     current_value = str(current or "").strip().lower()
     if current_value.startswith("cuda:") and current_value not in {option["value"] for option in options}:
         options.append({"label": f"{current_value} (not detected)", "value": current_value})
@@ -234,10 +266,10 @@ def resolve_runtime_choice(settings: dict[str, Any]) -> RuntimeChoice:
 
     cuda_names = list(torch_info.get("cuda_devices") or [])
     cuda_index, cuda_warning = resolve_gpu_index(settings.get("gpu_device"), len(cuda_names))
-    cuda_label = f"GPU {cuda_index}: {cuda_names[cuda_index]}" if cuda_index < len(cuda_names) else "CUDA"
+    cuda_label = cuda_gpu_label(cuda_index, cuda_names[cuda_index]) if cuda_index < len(cuda_names) else "CUDA"
 
     def choice(backend: str, device: str, label: str, source: str, detail: str) -> RuntimeChoice:
-        # Every CUDA choice runs on the card gpu_device selects (cuda:N, nvidia-smi numbering).
+        # Every CUDA choice runs on the card gpu_device selects (cuda:N = torch numbering in this process).
         if backend == "pytorch" and device == "cuda":
             device, label = f"cuda:{cuda_index}", cuda_label
             if cuda_warning:

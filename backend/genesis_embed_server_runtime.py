@@ -11,6 +11,7 @@ from typing import Any, List, Sequence
 
 import numpy as np
 
+from .g3_gpu import RateWindow
 from .genesis_embed_server_globals import (
     DEFAULT_MODEL_ID,
     MAX_SEQ_LENGTH_LIMIT,
@@ -1039,12 +1040,18 @@ def validate_input_lengths(model_id: str, texts: list[str], settings: dict[str, 
     return result.load_duration_ms
 
 
+# Texts (and media inputs) encoded per second over the last 30 s, for the dashboard's Performance chart. Fed by
+# every encode: batched and direct API requests, the admin playground and the benchmark. Drops to 0 when idle.
+texts_rate = RateWindow(30.0)
+
+
 def encode_texts(model_id: str, texts: list[str], settings: dict[str, Any] | None = None) -> EncodeResult:
     _begin_activity()
     on_cuda = True  # a failed call may have run passes on CUDA; trim_memory is a no-op without CUDA
     try:
         result = _encode_texts(model_id, texts, settings)
         on_cuda = result.backend == "pytorch" and result.device.startswith("cuda")
+        texts_rate.add(result.input_count)
         return result
     finally:
         _end_activity(on_cuda)
@@ -1116,6 +1123,7 @@ def encode_inputs(
     try:
         result = _encode_inputs(model_id, inputs, settings, token_counts)
         on_cuda = result.backend == "pytorch" and result.device.startswith("cuda")
+        texts_rate.add(result.input_count)
         return result
     finally:
         _end_activity(on_cuda)

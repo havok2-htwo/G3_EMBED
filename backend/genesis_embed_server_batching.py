@@ -67,6 +67,10 @@ class EmbedBatchManager:
             batch_runtime_state["queue_size"] = self._queue.qsize()
         return await future
 
+    def queue_depth(self) -> int:
+        """Requests waiting for the batch worker (the batch being encoded is not counted)."""
+        return self._queue.qsize()
+
     def snapshot(self) -> dict[str, Any]:
         with batch_state_lock:
             payload = dict(batch_runtime_state)

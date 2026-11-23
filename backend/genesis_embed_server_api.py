@@ -13,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .genesis_embed_server_auth import authorize_api_key, get_auth_store
+from .genesis_embed_server_auth import authorize_api_request, get_auth_store
 from .genesis_embed_server_globals import (
     MAX_INPUTS_PER_REQUEST,
     MAX_MEDIA_ITEMS_PER_FIELD,
@@ -639,7 +639,7 @@ def create_api(app: FastAPI) -> FastAPI:
 
     @app.post("/embed", response_model=EmbedResponse)
     async def embed(request: Request, payload: EmbedRequest):
-        api_key_id = authorize_api_key(request)
+        api_key_id = authorize_api_request(request)
         result, batched = await embed_texts_for_request(
             request,
             model_id=payload.model,
@@ -653,7 +653,9 @@ def create_api(app: FastAPI) -> FastAPI:
         return _result_to_response(result, batched=batched)
 
     @app.get("/v1/models")
-    async def v1_models():
+    async def v1_models(request: Request):
+        # Same gate as the embedding routes: open while no API key exists.
+        authorize_api_request(request)
         return {
             "object": "list",
             "data": [
@@ -671,7 +673,7 @@ def create_api(app: FastAPI) -> FastAPI:
 
     @app.post("/v1/embeddings")
     async def v1_embeddings(request: Request, payload: OpenAIEmbeddingRequest):
-        api_key_id = authorize_api_key(request)
+        api_key_id = authorize_api_request(request)
         result, _ = await embed_texts_for_request(
             request,
             model_id=payload.model,

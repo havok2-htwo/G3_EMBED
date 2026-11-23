@@ -144,7 +144,7 @@ def test_api_key_usage_counts_inputs(client, fake_model, monkeypatch):
         def record_api_key_usage(self, key_id, items):
             recorded.append((key_id, items))
 
-    monkeypatch.setattr(api, "authorize_api_key", lambda request: "key-1")
+    monkeypatch.setattr(api, "authorize_api_request", lambda request: "key-1")
     monkeypatch.setattr(api, "get_auth_store", lambda: Store())
     assert post(client, ["a", {"image": png_b64()}]).status_code == 200
     assert recorded == [("key-1", 2)]

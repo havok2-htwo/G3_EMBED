@@ -22,6 +22,8 @@ TWO_CARDS = {
 @pytest.fixture
 def two_cards(monkeypatch):
     monkeypatch.setattr(hardware, "get_system_snapshot", lambda: TWO_CARDS)
+    # nvidia-smi numbers the cards the other way round (as on a 2070 SUPER + 3090 host).
+    monkeypatch.setattr(hardware, "nvml_index_for_cuda", lambda cuda_index: {0: 1, 1: 0}.get(cuda_index))
 
 
 def test_default_is_auto():
@@ -41,7 +43,9 @@ def test_gpu_device_normalization(raw, expected):
 def test_runtime_choice_uses_the_selected_card(two_cards, setting, device):
     choice = hardware.resolve_runtime_choice({"execution_target": "nvidia", "gpu_device": setting})
     assert choice.device == device
-    assert choice.device_label.startswith(f"GPU {device[-1]}:")
+    # The label uses nvidia-smi numbering, never the torch index.
+    assert choice.device_label.startswith(f"GPU {1 - int(device[-1])} · ")
+    assert "NVIDIA" not in choice.device_label
 
 
 def test_missing_card_falls_back_to_gpu0_with_a_note(two_cards):
@@ -57,5 +61,13 @@ def test_cpu_target_ignores_the_gpu(two_cards):
 def test_options_list_every_card_and_keep_a_missing_saved_one(two_cards):
     options = hardware.gpu_device_options("cuda:3")
     assert [option["value"] for option in options] == ["auto", "cuda:0", "cuda:1", "cuda:3"]
-    assert options[2]["label"] == "GPU 1: NVIDIA GeForce RTX 2070 SUPER (8 GB)"
+    assert options[1]["label"] == "GPU 1 · GeForce RTX 3090 (24 GB)"
+    assert options[2]["label"] == "GPU 0 · GeForce RTX 2070 SUPER (8 GB)"
+    assert options[0]["label"] == "Auto (GPU 1 · GeForce RTX 3090 (24 GB))"
     assert "not detected" in options[3]["label"]
+
+
+def test_unknown_nvidia_smi_index_never_borrows_the_torch_index(monkeypatch):
+    monkeypatch.setattr(hardware, "get_system_snapshot", lambda: TWO_CARDS)
+    monkeypatch.setattr(hardware, "nvml_index_for_cuda", lambda cuda_index: None)
+    assert hardware.gpu_device_options()[1]["label"] == "cuda:0 · GeForce RTX 3090 (24 GB)"

@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from .genesis_embed_server_admin import create_admin_api
+from .genesis_embed_server_auth import get_auth_store
 from .genesis_embed_server_api import RequestBodyLimitMiddleware, create_api, request_validation_exception_handler
 from .genesis_embed_server_batching import EmbedBatchManager
 from .genesis_embed_server_globals import current_settings
@@ -75,6 +76,7 @@ async def shutdown_server(app: FastAPI) -> None:
     batch_manager = getattr(app.state, "embed_batch_manager", None)
     if batch_manager is not None:
         await batch_manager.stop()
+    get_auth_store().flush()  # pending per-key usage counters
 
 
 @asynccontextmanager
