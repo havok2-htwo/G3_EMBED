@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Admin UI harmonised with the other G3 services (G3 admin standard): header with status chips (state, model,
+  GPU, API Open/Protected), tabs (Dashboard, Playground, Models, Settings, Benchmark, History, API keys, Account),
+  shared tokens for colours, type scale and radii, dark and light theme, toasts, English text and en-US numbers.
+- Performance panel: GPU utilisation (0–100 %) and VRAM (0 … card total, all processes vs. this service) for the
+  card this service uses, plus Texts/s over a 30 s window and queue depth, from `GET /api/admin/perf`. GPU labels
+  follow nvidia-smi numbering (`GPU 1 · GeForce RTX 3090`).
+- Security: the static route no longer serves files outside `frontend/dist` (path traversal); API keys accept
+  `Authorization: Bearer` and the admin session, `GET /v1/models` is gated like the embedding routes, the key
+  store fails closed and writes atomically, keys show a masked hint; admin login is rate limited, uses a
+  SameSite=Strict cookie and an origin check, new passwords need 8 characters; the Hugging Face token is never
+  returned in clear text.
+- Settings: sticky save bar with unsaved/invalid counts; empty number fields are never sent as 0; the model cache
+  list, download and delete use the saved path and token; confirmations before deleting a model or preset.
 - First start uses the `24GB VRAM` preset: without a saved settings file the server starts with the defaults plus that tier (EmbeddingGemma 2 bf16, `encode_batch_size` 2, CUDA graphs, idle trim 5 s; the GPU stays `auto`) and saves them, so the dashboard shows what runs; the log names the applied preset. Existing installs keep their settings. The Docker entrypoint now seeds only `model_cache_path` `/app/models` plus a `_first_start_seed` marker (the other seeded keys equalled the defaults), so a fresh container also gets the tier and keeps the cache path.
 - Built-in GPU tiers now carry measured values (RTX 5090, EmbeddingGemma 2 bf16, CUDA graphs, `compile_mode` off, window 4096, idle trim 5 s): `32GB VRAM` `encode_batch_size` 4, about 3.0 GB idle / 5.3 GB peak process VRAM; `24GB VRAM` and `24+8 VRAM` `encode_batch_size` 2, about 3.0 / 4.1 GB (~91 % of the batch-4 ingestion throughput). Each tier now lists every preset key except `gpu_device`. The tier descriptions state the expected VRAM.
 - Idle trim (`idle_trim_seconds`, default 5, 0-3600, `0` = off; a preset key, in the Settings form and in `runtime.idle_trim`): this many seconds after the last text or media request, cached CUDA memory goes back to the driver, while every model's encode lock is held; CUDA graph pools stay. Text passes never released it before, so the process kept the peak of its largest pass for good (EmbeddingGemma 2 at batch 4: 5.3 GB instead of 3.0 GB idle, 12.3 GB at batch 16).

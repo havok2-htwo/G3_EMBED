@@ -252,3 +252,15 @@ def test_perf_endpoint_contract(admin_client, monkeypatch):
     metrics = {m["key"]: m for m in body["metrics"]}
     assert metrics["throughput"] == {"key": "throughput", "label": "Texts/s", "unit": "texts/s", "value": 3.0, "window_s": 30}
     assert metrics["queue"]["integer"] is True and metrics["queue"]["value"] == 0
+
+
+def test_stats_count_requests_and_errors_since_start(admin_client, monkeypatch):
+    from backend import genesis_embed_server_globals as globals_module
+
+    monkeypatch.setitem(globals_module.request_counters, "requests", 0)
+    monkeypatch.setitem(globals_module.request_counters, "errors", 0)
+    api._record_history({"success": True})
+    api._record_history({"success": False, "error": "x"})
+    summary = admin_client.get("/api/admin/stats").json()["summary"]
+    assert summary["requests_since_start"] == 2 and summary["errors_since_start"] == 1
+    assert summary["started_at"]

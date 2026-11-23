@@ -1,4 +1,4 @@
-import { FormEvent, startTransition, useEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   AdminOption,
@@ -6,13 +6,14 @@ import {
   ApiKeyInfo,
   BenchmarkResponse,
   CompareResponse,
-  CreatedApiKey,
   ManagedModel,
   MediaCounts,
   QueueResponse,
   RuntimeInfo,
   SettingsPreset,
   SettingsResponse,
+  SettingsUpdate,
+  SetupStatus,
   StatsResponse,
   changePassword,
   compareTexts,
@@ -22,8 +23,10 @@ import {
   deletePreset,
   downloadModel,
   getModels,
+  getPerf,
   getQueue,
   getSettings,
+  getSetupStatus,
   getStats,
   listApiKeys,
   listPresets,
@@ -34,45 +37,52 @@ import {
   saveSettings,
   whoami,
 } from "./api";
+import { ApiKeysPanel } from "./ApiKeysPanel";
+import { fmtDateTime, fmtDuration, fmtFixed, fmtGb, fmtMs, fmtNum, fmtRate } from "./format";
+import { PerfPanel, clearPerfHistory, gpuTitle, usePerfFeed, usePerfLatest } from "./PerfPanel";
+import { CopyButton, ToastHost, toast } from "./Toasts";
+import { useVisiblePolling } from "./usePolling";
 
-type HistoryEntry = {
-  timestamp?: string;
-  source_ip?: string;
-  route?: string;
-  model_id?: string;
-  dimension?: number;
-  backend?: string;
-  device?: string;
-  input_count?: number;
-  input_chars?: number;
-  input_tokens?: number | null;
-  media?: MediaCounts | null;
-  total_duration_ms?: number;
-  encode_duration_ms?: number;
-  texts_per_second?: number;
-  batched?: boolean;
-  success?: boolean;
-  error?: string;
-};
+// ---------- constants ----------
+type AuthState = "loading" | "error" | "login" | "change" | "ready";
+type TabId = "dashboard" | "playground" | "models" | "settings" | "benchmark" | "history" | "api-keys" | "account";
 
-type QueuePoint = {
-  queue: number;
-  textsPerSecond: number;
-};
+const TABS: Array<{ id: TabId; label: string }> = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "playground", label: "Playground" },
+  { id: "models", label: "Models" },
+  { id: "settings", label: "Settings" },
+  { id: "benchmark", label: "Benchmark" },
+  { id: "history", label: "History" },
+  { id: "api-keys", label: "API keys" },
+  { id: "account", label: "Account" },
+];
 
-type AuthState = "loading" | "login" | "change" | "ready";
-
-const NUMBER_LOCALE = "de-DE";
 const POLL_MS = 5000;
 const MODEL_STATUS_POLL_MS = 2000;
-const HISTORY_POINTS = 72;
+const KEYS_BACKGROUND_POLL_MS = 60_000;
+const MIN_PASSWORD_LENGTH = 8;
+const SERVICE_NAME = "G3 Embed";
+const PUBLIC_ROUTES = "POST /embed, POST /v1/embeddings and GET /v1/models";
+
+function tabFromHash(): TabId {
+  const value = window.location.hash.replace(/^#\/?/, "");
+  return TABS.some((tab) => tab.id === value) ? (value as TabId) : "dashboard";
+}
+
+const errorText = (error: unknown, fallback: string) => (error instanceof Error && error.message ? error.message : fallback);
+
+// ---------- settings form model ----------
+type NumberKey = { [K in keyof AdminSettings]: AdminSettings[K] extends number ? K : never }[keyof AdminSettings];
+// Number fields may be "" while the user edits them: an empty field is "not set" and is never sent as 0.
+type SettingsForm = { [K in keyof AdminSettings]: AdminSettings[K] extends number ? number | "" : AdminSettings[K] };
 
 const emptySettings: AdminSettings = {
-  default_model: "google/embeddinggemma-2",
+  default_model: "",
   execution_target: "auto",
   gpu_device: "auto",
   backend_override: "auto",
-  model_cache_path: ".\\models",
+  model_cache_path: "",
   batching_enabled: true,
   batch_wait_time_ms: 25,
   batch_max_texts: 32,
@@ -105,227 +115,185 @@ const emptySettings: AdminSettings = {
   max_concurrent_media_requests: 2,
 };
 
-type MediaLimitKey =
-  | "max_images_per_input"
-  | "max_images_per_request"
-  | "max_image_megapixels"
-  | "max_audio_clips_per_input"
-  | "max_audio_seconds_per_clip"
-  | "max_audio_seconds_per_request"
-  | "max_videos_per_request"
-  | "max_video_frames"
-  | "max_media_item_mb"
-  | "max_request_mb"
-  | "media_pass_budget_mb"
-  | "max_concurrent_media_requests";
+// Ranges mirror normalize_settings / MEDIA_LIMIT_SETTINGS in the backend (it clamps to the same values).
+const NUMBER_FIELDS: Record<NumberKey, { label: string; min: number; max: number; step?: number; hint?: string }> = {
+  batch_wait_time_ms: { label: "Batch wait (ms)", min: 0, max: 5000, hint: "How long the queue collects requests into one batch." },
+  batch_max_texts: { label: "Max texts per batch", min: 1, max: 2048 },
+  batch_max_chars: { label: "Max characters per batch", min: 256, max: 4_000_000 },
+  encode_batch_size: { label: "GPU batch size", min: 0, max: 2048, hint: "0 = automatic." },
+  max_seq_length: { label: "Max tokens per text", min: 0, max: 32768, step: 256, hint: "0 = the model's own limit." },
+  idle_trim_seconds: { label: "Idle trim (s)", min: 0, max: 3600, hint: "Seconds after the last request before cached CUDA memory goes back to the driver. 0 = off." },
+  max_images_per_input: { label: "Images per input", min: 1, max: 8 },
+  max_images_per_request: { label: "Images per request", min: 1, max: 32 },
+  max_image_megapixels: { label: "Image size (MP)", min: 1, max: 50 },
+  max_audio_clips_per_input: { label: "Audio clips per input", min: 1, max: 4 },
+  max_audio_seconds_per_clip: { label: "Audio per clip (s)", min: 1, max: 30 },
+  max_audio_seconds_per_request: { label: "Audio per request (s)", min: 1, max: 300 },
+  max_videos_per_request: { label: "Videos per request", min: 1, max: 2 },
+  max_video_frames: { label: "Frames per video", min: 1, max: 16 },
+  max_media_item_mb: { label: "Media item (MB)", min: 1, max: 25 },
+  max_request_mb: { label: "Request body (MB)", min: 1, max: 256 },
+  media_pass_budget_mb: { label: "VRAM budget per pass (MB)", min: 200, max: 4096, step: 100 },
+  max_concurrent_media_requests: { label: "Concurrent media requests", min: 1, max: 8 },
+};
 
-// min/max mirror MEDIA_LIMIT_SETTINGS in the backend (normalize_settings clamps to the same range).
-const mediaLimitFields: Array<{ key: MediaLimitKey; label: string; min: number; max: number; step?: number }> = [
-  { key: "max_images_per_input", label: "Images / Input", min: 1, max: 8 },
-  { key: "max_images_per_request", label: "Images / Request", min: 1, max: 32 },
-  { key: "max_image_megapixels", label: "Image Size (MP)", min: 1, max: 50 },
-  { key: "max_audio_clips_per_input", label: "Audio Clips / Input", min: 1, max: 4 },
-  { key: "max_audio_seconds_per_clip", label: "Audio / Clip (s)", min: 1, max: 30 },
-  { key: "max_audio_seconds_per_request", label: "Audio / Request (s)", min: 1, max: 300 },
-  { key: "max_videos_per_request", label: "Videos / Request", min: 1, max: 2 },
-  { key: "max_video_frames", label: "Frames / Video", min: 1, max: 16 },
-  { key: "max_media_item_mb", label: "Media Item (MB)", min: 1, max: 25 },
-  { key: "max_request_mb", label: "Request Body (MB)", min: 1, max: 256 },
-  { key: "media_pass_budget_mb", label: "VRAM Budget / Pass (MB)", min: 200, max: 4096, step: 100 },
-  { key: "max_concurrent_media_requests", label: "Concurrent Media Requests", min: 1, max: 8 },
+const MEDIA_LIMIT_KEYS: NumberKey[] = [
+  "max_images_per_input",
+  "max_images_per_request",
+  "max_image_megapixels",
+  "max_audio_clips_per_input",
+  "max_audio_seconds_per_clip",
+  "max_audio_seconds_per_request",
+  "max_videos_per_request",
+  "max_video_frames",
+  "max_media_item_mb",
+  "max_request_mb",
+  "media_pass_budget_mb",
+  "max_concurrent_media_requests",
 ];
 
-const mediaToggleFields: Array<{ key: "image_inputs_enabled" | "audio_inputs_enabled" | "video_inputs_enabled"; label: string }> = [
+const MEDIA_TOGGLES: Array<{ key: "image_inputs_enabled" | "audio_inputs_enabled" | "video_inputs_enabled"; label: string }> = [
   { key: "image_inputs_enabled", label: "Allow images" },
   { key: "audio_inputs_enabled", label: "Allow audio" },
   { key: "video_inputs_enabled", label: "Allow video (frames)" },
 ];
 
-const emptyOptions = {
-  models: [] as AdminOption[],
-  execution_targets: [] as AdminOption[],
-  gpu_devices: [] as AdminOption[],
-  backends: [] as AdminOption[],
-  precisions: [] as AdminOption[],
-  quantizations: [] as AdminOption[],
-  too_long_policies: [] as AdminOption[],
-  compile_modes: [] as AdminOption[],
+const SETTINGS_KEYS = (Object.keys(emptySettings) as Array<keyof AdminSettings>).filter((key) => key !== "huggingface_token");
+
+function fieldError(key: NumberKey, value: number | ""): string | null {
+  const spec = NUMBER_FIELDS[key];
+  if (value === "") return "Required.";
+  if (!Number.isInteger(value)) return "Whole numbers only.";
+  if (value < spec.min || value > spec.max) return `Must be between ${fmtNum(spec.min)} and ${fmtNum(spec.max)}.`;
+  return null;
+}
+
+function dirtySettingKeys(form: SettingsForm, saved: AdminSettings) {
+  return SETTINGS_KEYS.filter((key) => form[key] !== saved[key]);
+}
+
+const emptyOptions: SettingsResponse["options"] = {
+  models: [],
+  execution_targets: [],
+  gpu_devices: [],
+  backends: [],
+  precisions: [],
+  quantizations: [],
+  too_long_policies: [],
+  compile_modes: [],
 };
 
-function formatValue(value: number | null | undefined, suffix = "") {
-  if (value === null || value === undefined || Number.isNaN(value)) {
-    return "n/a";
-  }
-  const maximumFractionDigits = Number.isInteger(value) ? 0 : 2;
-  return `${new Intl.NumberFormat(NUMBER_LOCALE, { maximumFractionDigits }).format(value)}${suffix}`;
-}
+// ---------- small view helpers ----------
+type HistoryEntry = {
+  timestamp?: string;
+  route?: string;
+  model_id?: string;
+  dimension?: number;
+  input_count?: number;
+  input_chars?: number;
+  input_tokens?: number | null;
+  media?: MediaCounts | null;
+  total_duration_ms?: number;
+  encode_duration_ms?: number;
+  batched?: boolean;
+  success?: boolean;
+  error?: string;
+};
 
-// Per loaded model with compile_mode != off: whether dynamo really compiled (it falls back to eager silently).
-function compileSummary(models: Array<Record<string, unknown>>) {
-  const parts = models.flatMap((model) => {
-    const status = model.compile as { effective?: boolean; graphs?: number; reason?: string | null } | null | undefined;
-    if (!status) {
-      return [];
-    }
-    const name = String(model.model_id ?? "model");
-    if (!status.effective) {
-      return [`${name}: NOT effective (eager)${status.reason ? `, ${status.reason}` : ""}`];
-    }
-    return [`${name}: ${String(model.compile_mode)} (${formatValue(status.graphs ?? 0)} graphs)`];
-  });
-  return parts.length ? parts.join("; ") : "off";
-}
+type LoadedModel = {
+  model_id?: string;
+  backend?: string;
+  device?: string;
+  precision?: string;
+  compile_mode?: string;
+  quantization?: string;
+  compile?: { effective?: boolean; graphs?: number; reason?: string | null } | null;
+  max_seq_length?: number | null;
+  loaded_at?: number | null;
+  load_duration_ms?: number | null;
+};
 
-function idleTrimSummary(idle: RuntimeInfo["idle_trim"]) {
-  if (!idle) {
-    return "n/a";
-  }
-  if (!idle.idle_trim_seconds) {
-    return "off";
-  }
-  const next = idle.next_trim_in_seconds !== null ? `, next in ${formatValue(idle.next_trim_in_seconds)} s` : "";
-  const freed = idle.last_freed_mb !== null ? `, last freed ${formatValue(idle.last_freed_mb)} MB` : "";
-  return `after ${idle.idle_trim_seconds} s, ${formatValue(idle.trims)} trims${freed}${next}`;
-}
-
-function formatFixed(value: number | null | undefined, digits = 2, suffix = "") {
-  if (value === null || value === undefined || Number.isNaN(value)) {
-    return "n/a";
-  }
-  return `${new Intl.NumberFormat(NUMBER_LOCALE, {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  }).format(value)}${suffix}`;
-}
-
-function formatDateTime(value?: string | null) {
-  if (!value) {
-    return "n/a";
-  }
-  return new Intl.DateTimeFormat(NUMBER_LOCALE, {
-    year: "2-digit",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(value));
-}
-
-function formatModelSize(model: ManagedModel) {
-  if (model.size_on_disk_gb !== null && model.size_on_disk_gb !== undefined) {
-    return `${formatFixed(model.size_on_disk_gb, model.size_on_disk_gb >= 10 ? 1 : 2)} GB`;
-  }
-  if (model.approx_size_gb !== null && model.approx_size_gb !== undefined) {
-    return `~${formatFixed(model.approx_size_gb, model.approx_size_gb >= 10 ? 1 : 2)} GB`;
-  }
-  return "n/a";
-}
-
-function formatModelStatus(status: string) {
-  if (status === "ready") return "Ready";
-  if (status === "downloading") return "Downloading";
-  if (status === "partial") return "Partial";
-  if (status === "error") return "Error";
-  return "Missing";
-}
-
-// History never holds payloads, only counts; audio seconds are unknown when decoding failed.
-function formatMediaCounts(media: MediaCounts) {
-  const parts: string[] = [];
-  if (media.images) parts.push(`${formatValue(media.images)} img`);
-  if (media.audio_seconds) parts.push(`${formatValue(media.audio_seconds, " s")} audio`);
-  if (media.video_frames) parts.push(`${formatValue(media.video_frames)} frames`);
-  return parts.length > 0 ? parts.join(" · ") : "media";
-}
-
-function resolveOptionLabel(options: AdminOption[], value: string | null | undefined, fallback = "n/a") {
-  if (!value) {
-    return fallback;
-  }
+function optionLabel(options: AdminOption[], value: string | null | undefined) {
+  if (!value) return "—";
   return options.find((option) => option.value === value)?.label || value;
 }
 
-function numberFromRecord(record: Record<string, unknown>, key: string) {
-  const value = record[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+function modelSize(model: ManagedModel) {
+  if (model.size_on_disk_gb != null) return fmtGb(model.size_on_disk_gb);
+  if (model.approx_size_gb != null) return `~${fmtGb(model.approx_size_gb)}`;
+  return "—";
 }
 
-function QueueSparkline({ points }: { points: QueuePoint[] }) {
-  const visible = points.slice(-HISTORY_POINTS);
-  const queuePoints = visible.map((entry) => entry.queue);
-  const tpsPoints = visible.map((entry) => entry.textsPerSecond);
-  const width = 180;
-  const height = 180;
-  const pad = 18;
-  const chartWidth = width - pad * 2;
-  const chartHeight = height - pad * 2;
-  const queueMax = Math.max(1, ...queuePoints);
-  const tpsMax = Math.max(1, ...tpsPoints);
-  const pathFor = (values: number[], maxValue: number) =>
-    values
-      .map((value, index) => {
-        const x = pad + (values.length <= 1 ? 0 : (index / (values.length - 1)) * chartWidth);
-        const y = pad + chartHeight - (Math.max(0, value) / maxValue) * chartHeight;
-        return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
-      })
-      .join(" ");
+function modelStatusBadge(status: string) {
+  if (status === "ready") return <span className="badge ok">Cached</span>;
+  if (status === "downloading") return <span className="badge warn">Downloading</span>;
+  if (status === "partial") return <span className="badge warn">Partial</span>;
+  if (status === "error") return <span className="badge danger">Failed</span>;
+  return <span className="badge plain">Not downloaded</span>;
+}
 
+function mediaCounts(media: MediaCounts) {
+  const parts: string[] = [];
+  if (media.images) parts.push(`${fmtNum(media.images)} img`);
+  if (media.audio_seconds) parts.push(`${fmtNum(media.audio_seconds, 1)} s audio`);
+  if (media.video_frames) parts.push(`${fmtNum(media.video_frames)} frames`);
+  return parts.length > 0 ? parts.join(" · ") : "media";
+}
+
+function compileText(model: LoadedModel) {
+  const status = model.compile;
+  if (!status || model.compile_mode === "off") return "Off";
+  if (!status.effective) return `Not effective (eager)${status.reason ? `: ${status.reason}` : ""}`;
+  return `${model.compile_mode} · ${fmtNum(status.graphs ?? 0)} graphs`;
+}
+
+function idleTrimText(idle: RuntimeInfo["idle_trim"]) {
+  if (!idle) return "—";
+  if (!idle.idle_trim_seconds) return "Off";
+  const parts = [`After ${fmtDuration(idle.idle_trim_seconds)}`, `${fmtNum(idle.trims)} trims`];
+  if (idle.last_freed_mb != null) parts.push(`last freed ${fmtNum(idle.last_freed_mb)} MB`);
+  if (idle.next_trim_in_seconds != null) parts.push(`next in ${fmtDuration(idle.next_trim_in_seconds)}`);
+  return parts.join(" · ");
+}
+
+function Field({ label, hint, error, dirty, children, wide }: { label: string; hint?: ReactNode; error?: string | null; dirty?: boolean; children: ReactNode; wide?: boolean }) {
   return (
-    <div className="sparkline-shell">
-      <svg className="graph" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-label="Embedding queue and throughput history">
-        <line x1={pad} y1={pad} x2={pad} y2={height - pad} className="graph-grid-line" />
-        <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} className="graph-grid-line" />
-        {pathFor(queuePoints, queueMax) ? <path d={pathFor(queuePoints, queueMax)} className="graph-path graph-path-queue" /> : null}
-        {pathFor(tpsPoints, tpsMax) ? <path d={pathFor(tpsPoints, tpsMax)} className="graph-path graph-path-throughput" /> : null}
-      </svg>
-      <div className="graph-caption">
-        <span>Queue</span>
-        <strong>
-          {formatValue(queuePoints.length ? queuePoints[queuePoints.length - 1] : 0)}
-          {" | "}
-          {formatValue(tpsPoints.length ? tpsPoints[tpsPoints.length - 1] : 0, "/s")}
-        </strong>
-      </div>
+    <label className={`field${dirty ? " field-dirty" : ""}${wide ? " field-wide" : ""}`}>
+      <span className="field-label">{label}{dirty ? <span className="dirty-mark" aria-label="changed"> •</span> : null}</span>
+      {children}
+      {hint ? <span className="hint">{hint}</span> : null}
+      {error ? <span className="field-error">{error}</span> : null}
+    </label>
+  );
+}
+
+function Card({ label, value, sub, title }: { label: string; value: ReactNode; sub?: ReactNode; title?: string }) {
+  return (
+    <div className="card" title={title}>
+      <span className="card-label">{label}</span>
+      <span className="card-value">{value}</span>
+      {sub ? <span className="card-sub">{sub}</span> : null}
     </div>
   );
 }
 
-async function copyTextToClipboard(value: string) {
-  if (!value) {
-    return;
-  }
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
-  }
-  const textArea = document.createElement("textarea");
-  textArea.value = value;
-  textArea.setAttribute("readonly", "readonly");
-  textArea.style.position = "fixed";
-  textArea.style.opacity = "0";
-  document.body.appendChild(textArea);
-  textArea.select();
-  document.execCommand("copy");
-  document.body.removeChild(textArea);
+function PanelError({ message, onRetry }: { message: string | null; onRetry: () => void }) {
+  if (!message) return null;
+  return (
+    <div className="banner danger" role="alert">
+      <span>{message}</span>
+      <button type="button" className="secondary-button small-button" onClick={onRetry}>Retry</button>
+    </div>
+  );
 }
 
-function runtimeLabel(runtime: RuntimeInfo | null) {
-  if (!runtime) {
-    return "n/a";
-  }
-  const resolved = runtime.resolved_runtime;
-  return `${resolved.backend}/${resolved.device} (${resolved.device_label})`;
-}
-
-function hardwareSummary(runtime: RuntimeInfo | null) {
-  const items = runtime?.system.detected_accelerator_hardware ?? [];
-  return items.length > 0 ? items.join(", ") : "CPU fallback";
-}
-
+// ---------- app ----------
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>("loading");
+  const [bootError, setBootError] = useState("");
   const [currentUser, setCurrentUser] = useState("");
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<string | null>(null);
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
   const [loginUsername, setLoginUsername] = useState("admin");
   const [loginPassword, setLoginPassword] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
@@ -336,159 +304,257 @@ export default function App() {
   const [pwConfirm, setPwConfirm] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
   const [pwError, setPwError] = useState("");
-  const [pwMessage, setPwMessage] = useState("");
 
-  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[]>([]);
-  const [newKeyAlias, setNewKeyAlias] = useState("");
-  const [createdKey, setCreatedKey] = useState<CreatedApiKey | null>(null);
-  const [apiKeyBusy, setApiKeyBusy] = useState(false);
+  const [activeTab, setActiveTab] = useState<TabId>(tabFromHash);
+  const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
 
-  const [globalError, setGlobalError] = useState("");
-  const [actionMessage, setActionMessage] = useState("");
-  const [settingsForm, setSettingsForm] = useState<AdminSettings>(emptySettings);
+  // Server state (all tabs read from here, so a tab switch loses nothing).
+  const [savedSettings, setSavedSettings] = useState<AdminSettings | null>(null);
+  const [settingsForm, setSettingsForm] = useState<SettingsForm>(emptySettings);
   const [settingsOptions, setSettingsOptions] = useState(emptyOptions);
+  const [tokenSet, setTokenSet] = useState(false);
+  const [tokenHint, setTokenHint] = useState<string | null>(null);
+  const [tokenInput, setTokenInput] = useState("");
+  const [tokenClear, setTokenClear] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
-  const [managedModels, setManagedModels] = useState<ManagedModel[]>([]);
+  const [managedModels, setManagedModels] = useState<ManagedModel[] | null>(null);
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [queue, setQueue] = useState<QueueResponse | null>(null);
-  const [queueHistory, setQueueHistory] = useState<QueuePoint[]>([]);
+  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[] | null>(null);
+  const [panelErrors, setPanelErrors] = useState<{ settings: string | null; stats: string | null; queue: string | null; keys: string | null }>({
+    settings: null,
+    stats: null,
+    queue: null,
+    keys: null,
+  });
+
   const [saveBusy, setSaveBusy] = useState(false);
-  // True while the settings form holds edits (or a loaded preset) that are not saved yet: the 5 s dashboard poll
-  // then leaves the form alone instead of overwriting it with the stored settings.
-  const settingsDirty = useRef(false);
   const [presets, setPresets] = useState<SettingsPreset[]>([]);
-  const [presetName, setPresetName] = useState("");
+  const [presetChoice, setPresetChoice] = useState("");
+  const [presetSaveName, setPresetSaveName] = useState("");
   const [presetBusy, setPresetBusy] = useState(false);
-  const [modelBusyId, setModelBusyId] = useState("");
-  const [modelActionKind, setModelActionKind] = useState<"refresh" | "download" | "delete" | null>(null);
+
+  const [modelBusy, setModelBusy] = useState<{ id: string; kind: "download" | "delete" } | null>(null);
+  const [modelsRefreshing, setModelsRefreshing] = useState(false);
+
+  // "" = follow the saved default model.
+  const [compareModel, setCompareModel] = useState("");
   const [compareTextA, setCompareTextA] = useState("Genesis stores memories as vectors.");
   const [compareTextB, setCompareTextB] = useState("A vector database can compare semantic meaning.");
-  const [compareModel, setCompareModel] = useState(emptySettings.default_model);
   const [compareBusy, setCompareBusy] = useState(false);
   const [compareResult, setCompareResult] = useState<CompareResponse | null>(null);
+  const [benchmarkModel, setBenchmarkModel] = useState("");
   const [benchmarkInputs, setBenchmarkInputs] = useState("Text one\nText two\nText three");
-  const [benchmarkRepeatCount, setBenchmarkRepeatCount] = useState(3);
+  const [benchmarkRepeatCount, setBenchmarkRepeatCount] = useState<number | "">(3);
   const [benchmarkBusy, setBenchmarkBusy] = useState(false);
   const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkResponse | null>(null);
 
   const isReady = authState === "ready";
-  const hasDownloadingModels = managedModels.some((model) => model.status === "downloading");
-  const history = (stats?.history ?? []) as HistoryEntry[];
+  const saved = savedSettings ?? emptySettings;
+  const savedRef = useRef(saved);
+  const formRef = useRef(settingsForm);
+  savedRef.current = saved;
+  formRef.current = settingsForm;
 
-  function applySettings(payload: SettingsResponse) {
-    // Merge with defaults so an older backend without newer fields cannot crash the render.
-    if (!settingsDirty.current) {
-      setSettingsForm({ ...emptySettings, ...payload.settings });
-    }
-    setSettingsOptions({ ...emptyOptions, ...payload.options });
-    setManagedModels(payload.models ?? []);
-    setRuntime(payload.runtime);
-    setCompareModel((current) => current || payload.settings.default_model);
-  }
+  const dirtyKeys = savedSettings ? dirtySettingKeys(settingsForm, savedSettings) : [];
+  const tokenDirty = tokenInput.trim() !== "" || tokenClear;
+  const dirtyCount = dirtyKeys.length + (tokenDirty ? 1 : 0);
+  const invalidKeys = (Object.keys(NUMBER_FIELDS) as NumberKey[]).filter((key) => fieldError(key, settingsForm[key]) !== null);
+  const defaultModel = saved.default_model;
+  const hasDownloadingModels = (managedModels ?? []).some((model) => model.status === "downloading");
 
-  function recordQueuePoint(nextQueue: QueueResponse) {
-    const latestBatch = nextQueue.recent_batches?.[0] as Record<string, unknown> | undefined;
-    const point = {
-      queue: Number(nextQueue.queue_size ?? 0),
-      textsPerSecond: latestBatch ? numberFromRecord(latestBatch, "texts_per_second") : Number(nextQueue.last_batch_texts_per_second ?? 0),
-    };
-    setQueueHistory((current) => [...current.slice(-(HISTORY_POINTS - 1)), point]);
-  }
-
-  function resetDashboardState() {
-    startTransition(() => {
-      setStats(null);
-      setQueue(null);
-      setRuntime(null);
-      setManagedModels([]);
-      settingsDirty.current = false;
-      setSettingsForm(emptySettings);
-      setPresets([]);
-      setPresetName("");
-      setSettingsOptions(emptyOptions);
-      setApiKeys([]);
-      setCreatedKey(null);
-      setActionMessage("");
-      setGlobalError("");
-      setCompareResult(null);
-      setBenchmarkResult(null);
-    });
-  }
-
-  function handleApiError(error: unknown, fallback: string): boolean {
-    const message = error instanceof Error ? error.message : "";
-    if (message === "unauthorized") {
-      resetDashboardState();
-      setAuthState("login");
-      setAuthError("Your session has expired. Please sign in again.");
-      return true;
-    }
-    if (message === "password_change_required") {
-      setAuthState("change");
-      return true;
-    }
-    setGlobalError(error instanceof Error ? error.message : fallback);
-    return false;
-  }
-
-  async function refreshDashboard() {
-    try {
-      const [settingsResponse, statsResponse, queueResponse, keysResponse] = await Promise.all([
-        getSettings(),
-        getStats(),
-        getQueue(),
-        listApiKeys(),
-      ]);
-      startTransition(() => {
-        applySettings(settingsResponse);
-        setStats(statsResponse);
-        setQueue(queueResponse);
-        setApiKeys(keysResponse.keys);
-        recordQueuePoint(queueResponse);
-        setGlobalError("");
-      });
-    } catch (error) {
-      handleApiError(error, "Dashboard refresh failed.");
-    }
-  }
-
-  // Bootstrap: check the admin session on mount.
+  // ---------- tabs ----------
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const me = await whoami();
-        if (cancelled) return;
-        setCurrentUser(me.username);
-        setAuthState(me.must_change_password ? "change" : "ready");
-      } catch {
-        if (!cancelled) setAuthState("login");
+    const handler = () => setActiveTab(tabFromHash());
+    window.addEventListener("hashchange", handler);
+    return () => window.removeEventListener("hashchange", handler);
+  }, []);
+
+  function selectTab(tab: TabId, focus = false) {
+    if (window.location.hash !== `#${tab}`) window.location.hash = tab;
+    setActiveTab(tab);
+    if (focus) tabRefs.current[tab]?.focus();
+  }
+
+  function onTabKey(event: KeyboardEvent<HTMLElement>) {
+    const index = TABS.findIndex((tab) => tab.id === activeTab);
+    let next = -1;
+    if (event.key === "ArrowRight") next = (index + 1) % TABS.length;
+    else if (event.key === "ArrowLeft") next = (index - 1 + TABS.length) % TABS.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = TABS.length - 1;
+    if (next >= 0) {
+      event.preventDefault();
+      selectTab(TABS[next].id, true);
+    }
+  }
+
+  // ---------- session ----------
+  const resetState = useCallback(() => {
+    setSavedSettings(null);
+    setSettingsForm(emptySettings);
+    setSettingsOptions(emptyOptions);
+    setTokenSet(false);
+    setTokenHint(null);
+    setTokenInput("");
+    setTokenClear(false);
+    setRuntime(null);
+    setManagedModels(null);
+    setStats(null);
+    setQueue(null);
+    setApiKeys(null);
+    setPanelErrors({ settings: null, stats: null, queue: null, keys: null });
+    setPresets([]);
+    setPresetChoice("");
+    setPresetSaveName("");
+    setCompareResult(null);
+    setBenchmarkResult(null);
+    setPwCurrent("");
+    setPwNew("");
+    setPwConfirm("");
+    setPwError("");
+    clearPerfHistory();
+    toast.clear();
+  }, []);
+
+  /** true when the error was a lost session (handled: back to login) or a forced password change. */
+  const handleAuthError = useCallback(
+    (error: unknown): boolean => {
+      const message = error instanceof Error ? error.message : "";
+      if (message === "unauthorized") {
+        resetState();
+        setAuthState("login");
+        toast.warn("Session expired. Please log in again.");
+        return true;
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+      if (message === "password_change_required") {
+        setAuthState("change");
+        return true;
+      }
+      return false;
+    },
+    [resetState],
+  );
+
+  const bootstrap = useCallback(async () => {
+    setAuthState("loading");
+    setBootError("");
+    try {
+      const me = await whoami();
+      setCurrentUser(me.username);
+      setSessionExpiresAt(me.session_expires_at ?? null);
+      setAuthState(me.must_change_password ? "change" : "ready");
+    } catch (error) {
+      const message = errorText(error, "");
+      if (message === "unauthorized") {
+        setAuthState("login");
+      } else if (message === "password_change_required") {
+        setAuthState("change");
+      } else {
+        setBootError(message || "The server did not answer.");
+        setAuthState("error");
+      }
+    }
   }, []);
 
   useEffect(() => {
-    if (!isReady) return;
-    void refreshDashboard();
-    const interval = window.setInterval(() => {
-      void refreshDashboard();
-    }, POLL_MS);
-    return () => window.clearInterval(interval);
+    void bootstrap();
+  }, [bootstrap]);
+
+  // The login page shows the default-credentials hint only while first-login setup is pending.
+  useEffect(() => {
+    if (authState !== "login") return;
+    let cancelled = false;
+    getSetupStatus()
+      .then((status) => !cancelled && setSetupStatus(status))
+      .catch(() => !cancelled && setSetupStatus(null));
+    return () => {
+      cancelled = true;
+    };
   }, [authState]);
 
-  useEffect(() => {
-    if (!isReady || !hasDownloadingModels) {
-      return;
-    }
-    const interval = window.setInterval(() => {
-      void refreshModels();
-    }, MODEL_STATUS_POLL_MS);
-    return () => window.clearInterval(interval);
-  }, [authState, hasDownloadingModels, settingsForm.model_cache_path]);
+  // ---------- data ----------
+  const applySettingsResponse = useCallback((payload: SettingsResponse, replaceForm: boolean) => {
+    const next = { ...emptySettings, ...payload.settings };
+    const form = formRef.current;
+    const edits = replaceForm ? {} : Object.fromEntries(dirtySettingKeys(form, savedRef.current).map((key) => [key, form[key]]));
+    setSavedSettings(next);
+    // Polling never overwrites unsaved edits: they are laid over the fresh values.
+    setSettingsForm({ ...next, ...edits });
+    setSettingsOptions({ ...emptyOptions, ...payload.options });
+    setTokenSet(Boolean(payload.huggingface_token_set ?? payload.settings.huggingface_token));
+    setTokenHint(payload.huggingface_token_hint ?? (payload.settings.huggingface_token || null));
+    setManagedModels(payload.models ?? []);
+    setRuntime(payload.runtime);
+  }, []);
 
+  const refreshCore = useCallback(
+    async (signal?: AbortSignal) => {
+      const [settingsResult, statsResult, queueResult] = await Promise.allSettled([getSettings(signal), getStats(signal), getQueue(signal)]);
+      if (signal?.aborted) return;
+      for (const result of [settingsResult, statsResult, queueResult]) {
+        if (result.status === "rejected" && handleAuthError(result.reason)) return;
+      }
+      if (settingsResult.status === "fulfilled") applySettingsResponse(settingsResult.value, false);
+      if (statsResult.status === "fulfilled") setStats(statsResult.value);
+      if (queueResult.status === "fulfilled") setQueue(queueResult.value);
+      const reason = (result: PromiseSettledResult<unknown>, what: string) =>
+        result.status === "rejected" ? `Could not load ${what}: ${errorText(result.reason, "request failed")}` : null;
+      setPanelErrors((current) => ({
+        ...current,
+        settings: reason(settingsResult, "settings and runtime status"),
+        stats: reason(statsResult, "request statistics"),
+        queue: reason(queueResult, "the batch queue"),
+      }));
+    },
+    [applySettingsResponse, handleAuthError],
+  );
+
+  const refreshKeys = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
+        const response = await listApiKeys(signal);
+        if (signal?.aborted) return;
+        setApiKeys(response.keys);
+        setPanelErrors((current) => ({ ...current, keys: null }));
+      } catch (error) {
+        if (signal?.aborted || handleAuthError(error)) return;
+        setPanelErrors((current) => ({ ...current, keys: errorText(error, "request failed") }));
+      }
+    },
+    [handleAuthError],
+  );
+
+  const refreshModelsQuiet = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
+        const response = await getModels(signal);
+        if (!signal?.aborted) setManagedModels(response.models ?? []);
+      } catch (error) {
+        if (!signal?.aborted && !handleAuthError(error)) toast.error(`Could not refresh the model list: ${errorText(error, "request failed")}`);
+      }
+    },
+    [handleAuthError],
+  );
+
+  const reloadPresets = useCallback(async () => {
+    try {
+      setPresets((await listPresets()).presets);
+    } catch (error) {
+      if (!handleAuthError(error)) toast.error(`Could not load presets: ${errorText(error, "request failed")}`);
+    }
+  }, [handleAuthError]);
+
+  useVisiblePolling(refreshCore, POLL_MS, isReady);
+  useVisiblePolling(refreshKeys, activeTab === "api-keys" ? POLL_MS : KEYS_BACKGROUND_POLL_MS, isReady);
+  useVisiblePolling(refreshModelsQuiet, MODEL_STATUS_POLL_MS, isReady && hasDownloadingModels);
+  usePerfFeed((signal) => getPerf(signal), isReady);
+
+  useEffect(() => {
+    if (isReady) void reloadPresets();
+  }, [isReady, reloadPresets]);
+
+  // ---------- auth actions ----------
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setAuthBusy(true);
@@ -497,15 +563,18 @@ export default function App() {
       const me = await login(loginUsername.trim(), loginPassword);
       setCurrentUser(me.username);
       setLoginPassword("");
-      setAuthState(me.must_change_password ? "change" : "ready");
+      toast.clear();
+      if (me.must_change_password) {
+        setPwCurrent(loginPassword);
+        setAuthState("change");
+      } else {
+        const info = await whoami().catch(() => null);
+        setSessionExpiresAt(info?.session_expires_at ?? null);
+        setAuthState("ready");
+      }
     } catch (error) {
-      setAuthError(
-        error instanceof Error && error.message === "unauthorized"
-          ? "Invalid username or password."
-          : error instanceof Error
-            ? error.message
-            : "Login failed.",
-      );
+      const message = errorText(error, "Login failed.");
+      setAuthError(message === "unauthorized" ? "Invalid username or password." : message);
     } finally {
       setAuthBusy(false);
     }
@@ -514,9 +583,8 @@ export default function App() {
   async function handleChangePassword(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setPwError("");
-    setPwMessage("");
-    if (pwNew.length < 4) {
-      setPwError("The new password must be at least 4 characters.");
+    if (pwNew.length < MIN_PASSWORD_LENGTH) {
+      setPwError(`The new password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
       return;
     }
     if (pwNew !== pwConfirm) {
@@ -529,10 +597,16 @@ export default function App() {
       setPwCurrent("");
       setPwNew("");
       setPwConfirm("");
-      setPwMessage("Password updated.");
+      const info = await whoami().catch(() => null);
+      setSessionExpiresAt(info?.session_expires_at ?? null);
       setAuthState("ready");
+      toast.ok("Password changed.");
     } catch (error) {
-      setPwError(error instanceof Error ? error.message : "Password change failed.");
+      if (errorText(error, "") === "unauthorized") {
+        handleAuthError(error);
+        return;
+      }
+      setPwError(`Could not change the password: ${errorText(error, "request failed")}`);
     } finally {
       setPwBusy(false);
     }
@@ -544,120 +618,159 @@ export default function App() {
     } catch {
       // clear locally regardless
     }
-    resetDashboardState();
+    resetState();
     setLoginPassword("");
     setAuthState("login");
   }
 
-  async function handleCreateApiKey(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setApiKeyBusy(true);
-    setActionMessage("");
-    setGlobalError("");
+  // ---------- settings actions ----------
+  function updateSetting<K extends keyof SettingsForm>(key: K, value: SettingsForm[K]) {
+    setSettingsForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function discardSettings() {
+    setSettingsForm(saved);
+    setTokenInput("");
+    setTokenClear(false);
+  }
+
+  async function reloadSettings() {
     try {
-      const created = await createApiKey(newKeyAlias.trim());
-      setCreatedKey(created);
-      setNewKeyAlias("");
-      setActionMessage(`API key "${created.alias}" created. Copy it now — it is shown only once.`);
-      const keysResponse = await listApiKeys();
-      setApiKeys(keysResponse.keys);
+      const response = await getSettings();
+      applySettingsResponse(response, true);
+      setTokenInput("");
+      setTokenClear(false);
+      toast.info("Settings reloaded from the server.");
     } catch (error) {
-      handleApiError(error, "The API key could not be created.");
-    } finally {
-      setApiKeyBusy(false);
+      if (!handleAuthError(error)) toast.error(`Could not reload settings: ${errorText(error, "request failed")}`);
     }
   }
 
-  async function handleDeleteApiKey(keyId: string, alias: string) {
-    setActionMessage("");
-    setGlobalError("");
-    try {
-      await deleteApiKey(keyId);
-      setCreatedKey((current) => (current?.id === keyId ? null : current));
-      setActionMessage(`API key "${alias}" deleted.`);
-      const keysResponse = await listApiKeys();
-      setApiKeys(keysResponse.keys);
-    } catch (error) {
-      handleApiError(error, "The API key could not be deleted.");
+  async function handleSaveSettings(event?: FormEvent<HTMLFormElement>) {
+    event?.preventDefault();
+    if (invalidKeys.length > 0 || dirtyCount === 0) return;
+    const payload: SettingsUpdate = {};
+    for (const key of SETTINGS_KEYS) {
+      const value = settingsForm[key];
+      if (value !== "") (payload as Record<string, unknown>)[key] = value;
     }
-  }
-
-  async function handleSaveSettings(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+    if (tokenClear) payload.clear_huggingface_token = true;
+    else if (tokenInput.trim()) payload.huggingface_token = tokenInput.trim();
     setSaveBusy(true);
-    setActionMessage("");
-    setGlobalError("");
     try {
-      const response = await saveSettings(settingsForm);
-      settingsDirty.current = false;
-      applySettings(response);
-      setActionMessage("Settings saved.");
+      const response = await saveSettings(payload);
+      const adjusted = SETTINGS_KEYS.filter((key) => key in payload && (payload as Record<string, unknown>)[key] !== response.settings[key]);
+      applySettingsResponse(response, true);
+      setTokenInput("");
+      setTokenClear(false);
+      if (adjusted.length > 0) {
+        toast.warn(`Settings saved. The server adjusted: ${adjusted.map((key) => `${key} → ${String(response.settings[key])}`).join(", ")}.`);
+      } else {
+        toast.ok("Settings saved.");
+      }
     } catch (error) {
-      handleApiError(error, "Settings could not be saved.");
+      if (!handleAuthError(error)) toast.error(`Could not save settings: ${errorText(error, "request failed")}`);
     } finally {
       setSaveBusy(false);
     }
   }
 
-  async function refreshModels() {
-    if (!isReady) {
+  const selectedPreset = presets.find((preset) => preset.name === presetChoice);
+
+  function handleLoadPreset() {
+    if (!selectedPreset) return;
+    setSettingsForm((current) => ({ ...current, ...selectedPreset.values }));
+    toast.info(`Preset "${selectedPreset.name}" loaded into the form. Review it, then save the changes.${selectedPreset.note ? ` ${selectedPreset.note}` : ""}`);
+  }
+
+  async function handleSavePreset(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = presetSaveName.trim();
+    if (!name) return;
+    const builtIn = presets.find((preset) => preset.name === name && preset.built_in);
+    if (builtIn) {
+      toast.error(`"${name}" is a built-in preset and cannot be overwritten. Choose another name.`);
       return;
     }
-    setModelBusyId("__refresh__");
-    setModelActionKind("refresh");
+    if (presets.some((preset) => preset.name === name) && !window.confirm(`Overwrite preset "${name}"?\n\nIts saved values are replaced by the current form.`)) {
+      return;
+    }
+    const values = Object.fromEntries(SETTINGS_KEYS.filter((key) => settingsForm[key] !== "").map((key) => [key, settingsForm[key]])) as Partial<AdminSettings>;
+    setPresetBusy(true);
     try {
-      const response = await getModels(settingsForm.model_cache_path);
-      setManagedModels(response.models ?? []);
+      const response = await savePreset(name, values);
+      await reloadPresets();
+      setPresetChoice(response.preset.name);
+      setPresetSaveName("");
+      toast.ok(`Preset "${response.preset.name}" saved from the current form.`);
     } catch (error) {
-      handleApiError(error, "Model refresh failed.");
+      if (!handleAuthError(error)) toast.error(`Could not save the preset: ${errorText(error, "request failed")}`);
     } finally {
-      setModelBusyId("");
-      setModelActionKind(null);
+      setPresetBusy(false);
     }
   }
 
-  async function handleDownloadModel(model: ManagedModel) {
-    setModelBusyId(model.id);
-    setModelActionKind("download");
-    setGlobalError("");
+  async function handleDeletePreset() {
+    if (!selectedPreset || selectedPreset.built_in) return;
+    const name = selectedPreset.name;
+    if (!window.confirm(`Delete preset "${name}"?\n\nThe saved values are removed. The current settings do not change.`)) return;
+    setPresetBusy(true);
     try {
-      const response = await downloadModel(model.id, settingsForm.model_cache_path, settingsForm.huggingface_token);
-      setManagedModels(response.models ?? []);
+      await deletePreset(name);
+      setPresetChoice("");
+      await reloadPresets();
+      toast.ok(`Preset "${name}" deleted.`);
     } catch (error) {
-      handleApiError(error, "Model download failed.");
+      if (!handleAuthError(error)) toast.error(`Could not delete the preset: ${errorText(error, "request failed")}`);
     } finally {
-      setModelBusyId("");
-      setModelActionKind(null);
+      setPresetBusy(false);
+    }
+  }
+
+  // ---------- model actions ----------
+  async function handleRefreshModels() {
+    setModelsRefreshing(true);
+    await refreshModelsQuiet();
+    setModelsRefreshing(false);
+  }
+
+  async function handleDownloadModel(model: ManagedModel) {
+    setModelBusy({ id: model.id, kind: "download" });
+    try {
+      const response = await downloadModel(model.id);
+      setManagedModels(response.models ?? []);
+      toast.info(`Download of "${model.label}" started.`);
+    } catch (error) {
+      if (!handleAuthError(error)) toast.error(`Could not download "${model.label}": ${errorText(error, "request failed")}`);
+    } finally {
+      setModelBusy(null);
     }
   }
 
   async function handleDeleteModel(model: ManagedModel) {
-    setModelBusyId(model.id);
-    setModelActionKind("delete");
-    setGlobalError("");
+    const loaded = model.id === defaultModel ? "\n\nIt is the default model: the next request downloads it again." : "";
+    if (!window.confirm(`Delete cached model "${model.id}"?\n\nIt must be downloaded again before it can be loaded.${loaded}`)) return;
+    setModelBusy({ id: model.id, kind: "delete" });
     try {
-      const response = await deleteModel(model.id, settingsForm.model_cache_path);
+      const response = await deleteModel(model.id);
       setManagedModels(response.models ?? []);
+      toast.ok(response.removed ? `Cached model "${model.label}" deleted.` : `"${model.label}" was not in the cache.`);
     } catch (error) {
-      handleApiError(error, "Model delete failed.");
+      if (!handleAuthError(error)) toast.error(`Could not delete "${model.label}": ${errorText(error, "request failed")}`);
     } finally {
-      setModelBusyId("");
-      setModelActionKind(null);
+      setModelBusy(null);
     }
   }
 
+  // ---------- playground + benchmark ----------
   async function handleCompare(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setCompareBusy(true);
-    setCompareResult(null);
-    setGlobalError("");
     try {
-      const result = await compareTexts(compareModel, compareTextA, compareTextB);
+      const result = await compareTexts(compareModel || defaultModel, compareTextA, compareTextB);
       setCompareResult(result);
-      setActionMessage(`Compared ${result.dimension} dimensions in ${formatValue(result.total_duration_ms, " ms")}.`);
-      await refreshDashboard();
     } catch (error) {
-      handleApiError(error, "Compare failed.");
+      if (!handleAuthError(error)) toast.error(`Compare failed: ${errorText(error, "request failed")}`);
     } finally {
       setCompareBusy(false);
     }
@@ -667,681 +780,686 @@ export default function App() {
     event.preventDefault();
     const inputs = benchmarkInputs.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     if (inputs.length === 0) {
-      setGlobalError("Benchmark inputs are empty.");
+      toast.error("Add at least one input line.");
+      return;
+    }
+    if (benchmarkRepeatCount === "" || benchmarkRepeatCount < 1 || benchmarkRepeatCount > 128) {
+      toast.error("Repeats must be between 1 and 128.");
       return;
     }
     setBenchmarkBusy(true);
-    setBenchmarkResult(null);
-    setGlobalError("");
     try {
-      const result = await runBenchmark(compareModel, inputs, benchmarkRepeatCount);
+      const result = await runBenchmark(benchmarkModel || defaultModel, inputs, benchmarkRepeatCount);
       setBenchmarkResult(result);
-      setActionMessage(`Benchmark finished: ${formatValue(result.total_texts)} texts in ${formatValue(result.total_wall_time_ms, " ms")}.`);
     } catch (error) {
-      handleApiError(error, "Benchmark failed.");
+      if (!handleAuthError(error)) toast.error(`Benchmark failed: ${errorText(error, "request failed")}`);
     } finally {
       setBenchmarkBusy(false);
     }
   }
 
-  function updateSetting<K extends keyof AdminSettings>(key: K, value: AdminSettings[K]) {
-    settingsDirty.current = true;
-    setSettingsForm((current) => ({ ...current, [key]: value }));
+  // ---------- derived view data ----------
+  const perf = usePerfLatest();
+  const serviceGpus = (perf?.gpus ?? []).filter((gpu) => gpu.used_by_service);
+  const loadedModels = (runtime?.loaded_models ?? []) as LoadedModel[];
+  const lastError = runtime?.last_runtime_error ?? null;
+  const defaultLoaded = loadedModels.some((model) => model.model_id === defaultModel);
+  const history = (stats?.history ?? []) as HistoryEntry[];
+  const keyCount = apiKeys?.length ?? 0;
+  const modelLabel = optionLabel(settingsOptions.models, defaultModel);
+
+  let stateBadge: ReactNode = <span className="badge warn">Loading</span>;
+  if (runtime) {
+    if (lastError && loadedModels.length === 0) stateBadge = <span className="badge danger" title={lastError}>Error</span>;
+    else if (defaultLoaded) stateBadge = <span className="badge ok">Ready</span>;
+    else if (loadedModels.length > 0) stateBadge = <span className="badge ok" title="Another model is loaded; the default loads on first use.">Ready</span>;
+    else stateBadge = <span className="badge plain">Idle · model unloaded</span>;
   }
 
-  function handleDiscardSettings() {
-    settingsDirty.current = false;
-    setActionMessage("");
-    void refreshDashboard();
-  }
-
-  const selectedPreset = presets.find((preset) => preset.name === presetName);
-
-  async function reloadPresets() {
-    try {
-      setPresets((await listPresets()).presets);
-    } catch (error) {
-      handleApiError(error, "Presets could not be loaded.");
-    }
-  }
-
-  useEffect(() => {
-    // Loaded once per sign-in; saving or deleting reloads explicitly.
-    if (isReady) void reloadPresets();
-  }, [authState]);
-
-  function handleLoadPreset() {
-    if (!selectedPreset) return;
-    setActionMessage("");
-    setGlobalError("");
-    // Into the form only: Save Settings applies it through the normal validated PUT.
-    settingsDirty.current = true;
-    setSettingsForm((current) => ({ ...current, ...selectedPreset.values }));
-    setActionMessage(
-      `Preset "${selectedPreset.name}" loaded into the form; review it and click Save Settings to apply.` +
-        (selectedPreset.note ? ` ${selectedPreset.note}` : ""),
+  // ---------- render: pre-login states ----------
+  if (authState === "loading") {
+    return (
+      <>
+        <ToastHost />
+        <main className="login-shell">
+          <div className="state" role="status"><span className="spinner" />Loading…</div>
+        </main>
+      </>
     );
   }
 
-  async function handleSavePreset() {
-    const name = presetName.trim();
-    if (!name) return;
-    setPresetBusy(true);
-    setActionMessage("");
-    setGlobalError("");
-    try {
-      const response = await savePreset(name, settingsForm);
-      await reloadPresets();
-      setPresetName(response.preset.name);
-      setActionMessage(`Preset "${response.preset.name}" saved from the current form.`);
-    } catch (error) {
-      handleApiError(error, "Preset could not be saved.");
-    } finally {
-      setPresetBusy(false);
-    }
-  }
-
-  async function handleDeletePreset() {
-    if (!selectedPreset || selectedPreset.built_in) return;
-    const name = selectedPreset.name;
-    setPresetBusy(true);
-    setActionMessage("");
-    setGlobalError("");
-    try {
-      await deletePreset(name);
-      setPresetName("");
-      await reloadPresets();
-      setActionMessage(`Preset "${name}" deleted.`);
-    } catch (error) {
-      handleApiError(error, "Preset could not be deleted.");
-    } finally {
-      setPresetBusy(false);
-    }
-  }
-
-  if (authState === "loading") {
+  if (authState === "error") {
     return (
-      <main className="shell centered">
-        <section className="panel login-panel">
-          <p className="message">Loading...</p>
-        </section>
-      </main>
+      <>
+        <ToastHost />
+        <main className="login-shell">
+          <section className="panel login-panel">
+            <p className="eyebrow">G3 GPU service · Admin</p>
+            <h1>{SERVICE_NAME}</h1>
+            <div className="banner danger" role="alert">
+              <span>Could not reach the server: {bootError}</span>
+              <button type="button" className="secondary-button small-button" onClick={() => void bootstrap()}>Retry</button>
+            </div>
+          </section>
+        </main>
+      </>
     );
   }
 
   if (authState === "login") {
     return (
-      <main className="shell centered">
-        <section className="panel login-panel">
-          <div className="hero-copy">
-            <span className="eyebrow">Private Access</span>
-            <h1>G3_EMBED Admin</h1>
-            <p>
-              The public embedding API stays open until you create an API key. The private dashboard for models,
-              hardware routing, batching, and local test runs is protected by a username and password login.
-            </p>
-          </div>
-          <form className="login-form" onSubmit={handleLogin}>
-            <label>
-              <span>Username</span>
-              <input value={loginUsername} autoComplete="username" onChange={(event) => setLoginUsername(event.target.value)} placeholder="admin" />
-            </label>
-            <label>
-              <span>Password</span>
-              <input type="password" value={loginPassword} autoComplete="current-password" onChange={(event) => setLoginPassword(event.target.value)} placeholder="admin" />
-            </label>
-            <button type="submit" disabled={authBusy || !loginUsername.trim() || !loginPassword}>
-              {authBusy ? "Signing in..." : "Sign In"}
-            </button>
-            <p className="message">Default credentials: admin / admin. You must change the password on first login.</p>
-            {authError ? <p className="message error">{authError}</p> : null}
-          </form>
-        </section>
-      </main>
+      <>
+        <ToastHost />
+        <main className="login-shell">
+          <section className="panel login-panel" aria-labelledby="login-title">
+            <p className="eyebrow">G3 GPU service · Admin</p>
+            <h1 id="login-title">{SERVICE_NAME}</h1>
+            <p className="dim">Log in to manage models, settings and API keys.</p>
+            <form className="form-stack" onSubmit={handleLogin}>
+              <Field label="Username">
+                <input value={loginUsername} autoComplete="username" onChange={(event) => setLoginUsername(event.target.value)} />
+              </Field>
+              <Field label="Password">
+                <input type="password" value={loginPassword} autoComplete="current-password" onChange={(event) => setLoginPassword(event.target.value)} />
+              </Field>
+              {authError ? <div className="banner danger" role="alert">{authError}</div> : null}
+              {setupStatus?.setup_required ? (
+                <p className="hint">First start: log in as "{setupStatus.default_username}" with the password "admin". You set a new password right after.</p>
+              ) : null}
+              <div className="form-actions">
+                <button type="submit" disabled={authBusy || !loginUsername.trim() || !loginPassword} aria-busy={authBusy}>
+                  {authBusy ? "Logging in…" : "Log in"}
+                </button>
+              </div>
+            </form>
+          </section>
+        </main>
+      </>
     );
   }
+
+  const passwordForm = (submitLabel: string) => (
+    <form className="form-stack" onSubmit={handleChangePassword}>
+      <input type="text" className="sr-only" autoComplete="username" value={currentUser} readOnly tabIndex={-1} aria-hidden="true" />
+      <Field label="Current password">
+        <input type="password" value={pwCurrent} autoComplete="current-password" onChange={(event) => setPwCurrent(event.target.value)} />
+      </Field>
+      <Field label="New password" hint={`At least ${MIN_PASSWORD_LENGTH} characters.`}>
+        <input type="password" value={pwNew} autoComplete="new-password" minLength={MIN_PASSWORD_LENGTH} onChange={(event) => setPwNew(event.target.value)} />
+      </Field>
+      <Field label="Confirm new password" error={pwConfirm && pwNew !== pwConfirm ? "Does not match the new password." : null}>
+        <input type="password" value={pwConfirm} autoComplete="new-password" aria-invalid={Boolean(pwConfirm) && pwNew !== pwConfirm} onChange={(event) => setPwConfirm(event.target.value)} />
+      </Field>
+      {pwError ? <div className="banner danger" role="alert">{pwError}</div> : null}
+      <div className="form-actions">
+        <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm} aria-busy={pwBusy}>{pwBusy ? "Saving…" : submitLabel}</button>
+      </div>
+    </form>
+  );
 
   if (authState === "change") {
     return (
-      <main className="shell centered">
-        <section className="panel login-panel">
-          <div className="hero-copy">
-            <span className="eyebrow">Security</span>
-            <h1>Set a New Password</h1>
-            <p>You are signed in as <strong>{currentUser || "admin"}</strong>. Choose a new password before continuing.</p>
-          </div>
-          <form className="login-form" onSubmit={handleChangePassword}>
-            <label>
-              <span>Current Password</span>
-              <input type="password" value={pwCurrent} autoComplete="current-password" onChange={(event) => setPwCurrent(event.target.value)} />
-            </label>
-            <label>
-              <span>New Password</span>
-              <input type="password" value={pwNew} autoComplete="new-password" onChange={(event) => setPwNew(event.target.value)} />
-            </label>
-            <label>
-              <span>Confirm New Password</span>
-              <input type="password" value={pwConfirm} autoComplete="new-password" onChange={(event) => setPwConfirm(event.target.value)} />
-            </label>
-            <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm}>
-              {pwBusy ? "Saving..." : "Save New Password"}
-            </button>
-            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Cancel & Sign Out</button>
-            {pwMessage ? <p className="message">{pwMessage}</p> : null}
-            {pwError ? <p className="message error">{pwError}</p> : null}
-          </form>
-        </section>
-      </main>
+      <>
+        <ToastHost />
+        <main className="login-shell">
+          <section className="panel login-panel" aria-labelledby="change-title">
+            <p className="eyebrow">G3 GPU service · Admin</p>
+            <h1 id="change-title">Set a new password</h1>
+            <p className="dim">Signed in as <strong>{currentUser || "admin"}</strong>. Choose your own password before you continue.</p>
+            {passwordForm("Change password")}
+            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Log out</button>
+          </section>
+        </main>
+      </>
     );
   }
 
-  return (
-    <main className="shell">
-      <header className="hero">
-        <div className="hero-copy-block">
-          <span className="eyebrow">G3_EMBED</span>
-          <h1>Local embedding server</h1>
-          <p className="hero-copy">Genesis-compatible vectors, OpenAI-compatible embeddings, and a small lab for checking semantic distance.</p>
-        </div>
-        <div className="hero-actions">
-          <a className="secondary-link" href="/docs">OpenAPI</a>
-          <button type="button" className="secondary-button" onClick={() => void refreshDashboard()}>Refresh</button>
-          <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Logout</button>
-        </div>
-      </header>
+  // ---------- render: tabs ----------
+  const dashboard = (
+    <>
+      <div className="grid grid-auto card-row">
+        <Card label="Model" value={<span className="card-value-text" title={defaultModel}>{modelLabel}</span>} sub={<span className="mono">{defaultModel || "—"}</span>} />
+        <Card label="State" value={stateBadge} sub={queue ? `${fmtNum(queue.queue_size ?? 0)} waiting in the queue` : "—"} />
+        <Card
+          label="Requests"
+          value={fmtNum(stats?.summary.requests_since_start ?? null)}
+          sub={stats?.summary.started_at ? `since ${fmtDateTime(stats.summary.started_at)}` : "since start"}
+        />
+        <Card
+          label="Errors"
+          value={fmtNum(stats?.summary.errors_since_start ?? null)}
+          sub={stats?.summary.avg_total_duration_ms != null ? `avg. request ${fmtMs(stats.summary.avg_total_duration_ms)}` : "since start"}
+        />
+      </div>
+      <PanelError message={panelErrors.stats} onRetry={() => void refreshCore()} />
 
-      {globalError ? <p className="message error">{globalError}</p> : null}
-      {actionMessage ? <p className="message">{actionMessage}</p> : null}
+      <PerfPanel />
 
-      <section className="stats-grid">
-        <div className="stat-card">
-          <span>Active Model</span>
-          <strong>{resolveOptionLabel(settingsOptions.models, settingsForm.default_model)}</strong>
-          <small className="mono">{settingsForm.default_model}</small>
+      <section className="panel" aria-labelledby="queue-title">
+        <div className="panel-head">
+          <h2 id="queue-title">Batch queue</h2>
+          {queue ? <span className={`badge ${queue.worker_running ? "ok" : "warn"}`}>{queue.worker_running ? "Worker running" : "Worker stopped"}</span> : null}
+          <p className="hint">Requests are collected into batches when batching is on. The batch values describe the latest batch only.</p>
         </div>
-        <div className="stat-card">
-          <span>Runtime</span>
-          <strong>{runtimeLabel(runtime)}</strong>
-          <small>{runtime?.resolved_runtime.detail ?? "n/a"}</small>
+        <PanelError message={panelErrors.queue} onRetry={() => void refreshCore()} />
+        <div className="grid grid-auto card-row">
+          <Card label="Waiting" value={fmtNum(queue?.queue_size ?? null)} sub="requests in the queue" />
+          <Card label="Active batch" value={queue?.active_batch_id ? fmtNum(queue.active_batch_size ?? null) : "None"} sub={queue?.active_batch_id ? `${fmtNum(queue.active_batch_chars ?? null)} characters` : "no batch running"} />
+          <Card label="Latest batch" value={fmtMs(queue?.last_batch_duration_ms)} sub={queue?.last_batch_texts_per_second != null ? `${fmtRate(queue.last_batch_texts_per_second, "texts/s")} · ${fmtDateTime(queue.last_batch_completed_at, true)}` : "—"} />
+          <Card label="Processed" value={fmtNum(queue?.total_texts_processed ?? null)} sub={`texts in ${fmtNum(queue?.total_batches_processed ?? null)} batches since start`} />
         </div>
-        <div className="stat-card">
-          <span>Requests</span>
-          <strong>{formatValue(stats?.summary.total_requests ?? 0)}</strong>
-          <small>{formatValue(stats?.summary.avg_total_duration_ms, " ms")} avg total</small>
-        </div>
-        <div className="stat-card">
-          <span>Signed in as</span>
-          <strong>{currentUser || "admin"}</strong>
-          <small>{formatValue(queue?.queue_size ?? 0)} in queue</small>
-        </div>
+        {queue?.last_error ? <div className="banner danger">Last batch failed: {queue.last_error}</div> : null}
       </section>
 
-      <section className="panel">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Account & API Keys</span>
-            <h2>Access</h2>
-          </div>
+      <section className="panel" aria-labelledby="system-title">
+        <div className="panel-head">
+          <h2 id="system-title">System</h2>
+          <p className="hint">Runtime routing, loaded models and detected hardware.</p>
         </div>
-        <div className="panel-grid">
-          <form className="settings-form" onSubmit={handleChangePassword}>
-            <span className="eyebrow full-width">Change password ({currentUser || "admin"})</span>
-            <label className="full-width"><span>Current Password</span><input type="password" value={pwCurrent} onChange={(event) => setPwCurrent(event.target.value)} /></label>
-            <label className="full-width"><span>New Password</span><input type="password" value={pwNew} onChange={(event) => setPwNew(event.target.value)} /></label>
-            <label className="full-width"><span>Confirm</span><input type="password" value={pwConfirm} onChange={(event) => setPwConfirm(event.target.value)} /></label>
-            <div className="form-actions full-width">
-              <button type="submit" disabled={pwBusy || !pwCurrent || !pwNew || !pwConfirm}>{pwBusy ? "Saving..." : "Change Password"}</button>
-              {pwMessage ? <p className="message">{pwMessage}</p> : null}
-              {pwError ? <p className="message error">{pwError}</p> : null}
-            </div>
-          </form>
-          <div className="side-panel">
-            <span className="eyebrow full-width">API Keys</span>
-            <p className="section-copy">
-              While no key exists, <code>POST /embed</code> and <code>POST /v1/embeddings</code> are open. Once one key
-              exists, a valid <code>X-API-Key</code> header is required. Usage counts processed texts per key.
-            </p>
-            {createdKey ? (
-              <div className="key-token-card">
-                <strong>{createdKey.alias}</strong>
-                <p>Copy this key now — it is shown only once.</p>
-                <div className="key-token-value mono">{createdKey.token}</div>
-                <button type="button" className="secondary-button" onClick={() => void copyTextToClipboard(createdKey.token)}>Copy</button>
-              </div>
-            ) : null}
-            <form className="benchmark-form" onSubmit={handleCreateApiKey}>
-              <label className="full-width"><span>Alias</span><input value={newKeyAlias} onChange={(event) => setNewKeyAlias(event.target.value)} placeholder="e.g. Key fuer Projekt X" /></label>
-              <div className="form-actions"><button type="submit" disabled={apiKeyBusy || !newKeyAlias.trim()}>{apiKeyBusy ? "Creating..." : "Create API Key"}</button></div>
-            </form>
-            <div className="table-wrap">
-              <table>
-                <thead><tr><th>Alias</th><th>Created</th><th>Texts</th><th>Requests</th><th>Last Used</th><th></th></tr></thead>
-                <tbody>
-                  {apiKeys.length === 0 ? <tr><td colSpan={6}>No API keys — the public API is currently open.</td></tr> : null}
-                  {apiKeys.map((key) => (
-                    <tr key={key.id}>
-                      <td>{key.alias}</td>
-                      <td>{formatDateTime(key.created_at)}</td>
-                      <td>{formatValue(key.usage.total_items_processed)}</td>
-                      <td>{key.usage.request_count}</td>
-                      <td>{formatDateTime(key.usage.last_used_at)}</td>
-                      <td><button type="button" className="ghost-button danger-button" onClick={() => void handleDeleteApiKey(key.id, key.alias)}>Delete</button></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <div className="panel-grid">
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <span className="eyebrow">Embedding Lab</span>
-              <h2>Compare two texts</h2>
-            </div>
-            <div className="loaded-model">
-              <span>Hardware</span>
-              <strong>{hardwareSummary(runtime)}</strong>
-            </div>
-          </div>
-          <form className="lab-form" onSubmit={handleCompare}>
-            <label>
-              <span>Model</span>
-              <select value={compareModel} onChange={(event) => setCompareModel(event.target.value)}>
-                {settingsOptions.models.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label className="full-width">
-              <span>Text A</span>
-              <textarea value={compareTextA} onChange={(event) => setCompareTextA(event.target.value)} rows={6} />
-            </label>
-            <label className="full-width">
-              <span>Text B</span>
-              <textarea value={compareTextB} onChange={(event) => setCompareTextB(event.target.value)} rows={6} />
-            </label>
-            <div className="form-actions full-width">
-              <button type="submit" disabled={compareBusy}>{compareBusy ? "Embedding..." : "Embed & Compare"}</button>
-              {compareResult ? (
-                <button type="button" className="secondary-button" onClick={() => void copyTextToClipboard(JSON.stringify(compareResult.vectors, null, 2))}>
-                  Copy Vectors
-                </button>
-              ) : null}
-            </div>
-          </form>
-
-          {compareResult ? (
-            <div className="result-grid">
-              <div><span>Cosine</span><strong>{formatFixed(compareResult.cosine_similarity, 6)}</strong></div>
-              <div><span>Dot</span><strong>{formatFixed(compareResult.dot_product, 6)}</strong></div>
-              <div><span>Distance</span><strong>{formatFixed(compareResult.euclidean_distance, 6)}</strong></div>
-              <div><span>Dimension</span><strong>{formatValue(compareResult.dimension)}</strong></div>
-              <div><span>Total</span><strong>{formatValue(compareResult.total_duration_ms, " ms")}</strong></div>
-              <div><span>Encode</span><strong>{formatValue(compareResult.encode_duration_ms, " ms")}</strong></div>
-              <div><span>Backend</span><strong>{compareResult.backend}/{compareResult.device}</strong></div>
-              <div><span>Batched</span><strong>{compareResult.batched ? "yes" : "no"}</strong></div>
-            </div>
-          ) : null}
-        </section>
-
-        <section className="panel side-panel">
-          <div className="section-heading">
-            <div>
-              <span className="eyebrow">Queue</span>
-              <h2>Live throughput</h2>
-            </div>
-          </div>
-          <QueueSparkline points={queueHistory} />
-          <div className="queue-metrics">
-            <div><span>Active Batch</span><strong>{queue?.active_batch_id ?? "none"}</strong></div>
-            <div><span>Active Texts</span><strong>{formatValue(queue?.active_batch_size ?? 0)}</strong></div>
-            <div><span>Active Chars</span><strong>{formatValue(queue?.active_batch_chars ?? 0)}</strong></div>
-            <div><span>Processed</span><strong>{formatValue(queue?.total_texts_processed ?? 0)}</strong></div>
-          </div>
-        </section>
-      </div>
-
-      <div className="content-grid">
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <span className="eyebrow">Settings</span>
-              <h2>Model, backend, batching</h2>
-            </div>
-          </div>
-          <span className="eyebrow">Presets</span>
-          <p className="section-copy">
-            Built-in GPU tiers: 32GB VRAM (RTX 5090) and 24GB VRAM (RTX 4090) with every G3 service on one card; 24+8 VRAM runs
-            EMBED on the 24 GB card of a 3090 + 2070S box (the GPU is picked by card size). Loading fills the form below;
-            Save Settings applies it.
-          </p>
-          <div className="settings-form">
-            <label>
-              <span>Preset</span>
-              <select value={selectedPreset ? presetName : ""} onChange={(event) => setPresetName(event.target.value)}>
-                <option value="">(choose)</option>
-                {presets.map((preset) => (
-                  <option key={preset.name} value={preset.name}>{preset.built_in ? `${preset.name} (built-in)` : preset.name}</option>
-                ))}
-              </select>
-              {selectedPreset?.description ? <small className="muted">{selectedPreset.description}</small> : null}
-              {selectedPreset?.note ? <small className="muted">{selectedPreset.note}</small> : null}
-            </label>
-            <label>
-              <span>Save the current form as</span>
-              <input value={presetName} maxLength={64} placeholder="preset name" onChange={(event) => setPresetName(event.target.value)} />
-              <small className="muted">Built-in names cannot be overwritten. The cache path and the Hugging Face token are never stored in a preset.</small>
-            </label>
-            <div className="button-row full-width">
-              <button type="button" className="secondary-button" onClick={handleLoadPreset} disabled={!selectedPreset || presetBusy || saveBusy}>Load into form</button>
-              <button type="button" className="secondary-button" onClick={() => void handleSavePreset()} disabled={!presetName.trim() || selectedPreset?.built_in === true || presetBusy}>Save as preset</button>
-              <button type="button" className="ghost-button danger-button" onClick={() => void handleDeletePreset()} disabled={!selectedPreset || selectedPreset.built_in || presetBusy}>Delete preset</button>
-            </div>
-          </div>
-          <div className="panel-divider" />
-          <form className="settings-form" onSubmit={handleSaveSettings}>
-            <label>
-              <span>Default Model</span>
-              <select value={settingsForm.default_model} onChange={(event) => updateSetting("default_model", event.target.value)}>
-                {settingsOptions.models.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Target</span>
-              <select value={settingsForm.execution_target} onChange={(event) => updateSetting("execution_target", event.target.value)}>
-                {settingsOptions.execution_targets.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label title="Numbered like nvidia-smi. Switching reloads the model on the new card; the old card keeps the CUDA context (~0.5 GB) until restart.">
-              <span>GPU</span>
-              <select value={settingsForm.gpu_device} onChange={(event) => updateSetting("gpu_device", event.target.value)}>
-                {!(settingsOptions.gpu_devices ?? []).some((option) => option.value === settingsForm.gpu_device) ? (
-                  <option value={settingsForm.gpu_device}>{settingsForm.gpu_device}</option>
-                ) : null}
-                {(settingsOptions.gpu_devices ?? []).map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Backend</span>
-              <select value={settingsForm.backend_override} onChange={(event) => updateSetting("backend_override", event.target.value)}>
-                {settingsOptions.backends.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Precision</span>
-              <select value={settingsForm.precision} onChange={(event) => updateSetting("precision", event.target.value)}>
-                {settingsOptions.precisions.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Quantization (CUDA)</span>
-              <select value={settingsForm.quantization} onChange={(event) => updateSetting("quantization", event.target.value)}>
-                {settingsOptions.quantizations.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Compile</span>
-              <select value={settingsForm.compile_mode} onChange={(event) => updateSetting("compile_mode", event.target.value)}>
-                {settingsOptions.compile_modes.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Batch Wait (ms)</span>
-              <input type="number" min={0} value={settingsForm.batch_wait_time_ms} onChange={(event) => updateSetting("batch_wait_time_ms", Number(event.target.value))} />
-            </label>
-            <label>
-              <span>Max Texts</span>
-              <input type="number" min={1} value={settingsForm.batch_max_texts} onChange={(event) => updateSetting("batch_max_texts", Number(event.target.value))} />
-            </label>
-            <label>
-              <span>Max Chars</span>
-              <input type="number" min={256} value={settingsForm.batch_max_chars} onChange={(event) => updateSetting("batch_max_chars", Number(event.target.value))} />
-            </label>
-            <label>
-              <span>GPU Batch Size (0 = auto)</span>
-              <input type="number" min={0} value={settingsForm.encode_batch_size} onChange={(event) => updateSetting("encode_batch_size", Number(event.target.value))} />
-            </label>
-            <label>
-              <span>Max Tokens / Text (0 = model default)</span>
-              <input type="number" min={0} step={256} value={settingsForm.max_seq_length} onChange={(event) => updateSetting("max_seq_length", Number(event.target.value))} />
-            </label>
-            <label title="Seconds after the last request before the pass working set (cached CUDA memory) goes back to the driver; CUDA graphs stay.">
-              <span>Idle Trim (s, 0 = off)</span>
-              <input type="number" min={0} max={3600} value={settingsForm.idle_trim_seconds} onChange={(event) => updateSetting("idle_trim_seconds", Number(event.target.value))} />
-            </label>
-            <label>
-              <span>Texts Over Token Limit</span>
-              <select value={settingsForm.too_long_policy} onChange={(event) => updateSetting("too_long_policy", event.target.value)}>
-                {settingsOptions.too_long_policies.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <label className="full-width">
-              <span>Cache Path</span>
-              <input value={settingsForm.model_cache_path} onChange={(event) => updateSetting("model_cache_path", event.target.value)} />
-            </label>
-            <label className="full-width">
-              <span>Hugging Face Token</span>
-              <input type="password" placeholder="hf_... (optional)" value={settingsForm.huggingface_token} onChange={(event) => updateSetting("huggingface_token", event.target.value)} />
-            </label>
-            <label className="switch-row">
-              <input type="checkbox" checked={settingsForm.batching_enabled} onChange={(event) => updateSetting("batching_enabled", event.target.checked)} />
-              <span>Enable batching</span>
-            </label>
-            <label className="switch-row">
-              <input type="checkbox" checked={settingsForm.warmup_on_load} onChange={(event) => updateSetting("warmup_on_load", event.target.checked)} />
-              <span>Warm up on load</span>
-            </label>
-            <label className="switch-row">
-              <input type="checkbox" checked={settingsForm.encode_token_batching} onChange={(event) => updateSetting("encode_token_batching", event.target.checked)} />
-              <span>Pack texts by tokens</span>
-            </label>
-            <label className="switch-row">
-              <input type="checkbox" checked={settingsForm.cuda_graphs} onChange={(event) => updateSetting("cuda_graphs", event.target.checked)} />
-              <span>CUDA graphs (EmbeddingGemma 2)</span>
-            </label>
-            <span className="eyebrow full-width">Media limits (image / audio / video)</span>
-            <div className="button-row full-width">
-              {mediaToggleFields.map((field) => (
-                <label key={field.key} className="switch-row">
-                  <input type="checkbox" checked={settingsForm[field.key]} onChange={(event) => updateSetting(field.key, event.target.checked)} />
-                  <span>{field.label}</span>
-                </label>
-              ))}
-            </div>
-            {mediaLimitFields.map((field) => (
-              <label key={field.key}>
-                <span>{field.label}</span>
-                <input type="number" min={field.min} max={field.max} step={field.step ?? 1} value={settingsForm[field.key]} onChange={(event) => updateSetting(field.key, Number(event.target.value))} />
-              </label>
-            ))}
-            <div className="form-actions full-width">
-              <button type="submit" disabled={saveBusy}>{saveBusy ? "Saving..." : "Save Settings"}</button>
-              <button type="button" className="ghost-button" disabled={saveBusy} onClick={handleDiscardSettings}>Discard changes</button>
-            </div>
-          </form>
-        </section>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <span className="eyebrow">Benchmark</span>
-              <h2>Throughput test</h2>
-            </div>
-          </div>
-          <form className="benchmark-form" onSubmit={handleBenchmark}>
-            <label className="full-width">
-              <span>Inputs</span>
-              <textarea value={benchmarkInputs} onChange={(event) => setBenchmarkInputs(event.target.value)} rows={6} />
-            </label>
-            <label>
-              <span>Repeats</span>
-              <input type="number" min={1} max={128} value={benchmarkRepeatCount} onChange={(event) => setBenchmarkRepeatCount(Math.max(1, Math.min(128, Number(event.target.value) || 1)))} />
-            </label>
-            <div className="form-actions">
-              <button type="submit" disabled={benchmarkBusy}>{benchmarkBusy ? "Running..." : "Run Benchmark"}</button>
-            </div>
-          </form>
-          {benchmarkResult ? (
-            <div className="result-grid compact">
-              <div><span>Total</span><strong>{formatValue(benchmarkResult.total_wall_time_ms, " ms")}</strong></div>
-              <div><span>Texts/s</span><strong>{formatValue(benchmarkResult.texts_per_second)}</strong></div>
-              <div><span>Texts</span><strong>{formatValue(benchmarkResult.total_texts)}</strong></div>
-              <div><span>Backend</span><strong>{benchmarkResult.backend}/{benchmarkResult.device}</strong></div>
-            </div>
-          ) : null}
-        </section>
-      </div>
-
-      <section className="panel">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Models</span>
-            <h2>Cache Manager</h2>
-            <p className="section-copy">Download or remove supported embedding models in the configured cache path.</p>
-          </div>
-          <button type="button" className="secondary-button" onClick={() => void refreshModels()} disabled={modelBusyId === "__refresh__"}>
-            {modelBusyId === "__refresh__" ? "Refreshing..." : "Refresh Models"}
-          </button>
-        </div>
-        <div className="model-path-card">
-          <span>Selected Cache Path</span>
-          <strong className="mono">{settingsForm.model_cache_path || "Default Hugging Face cache"}</strong>
-        </div>
+        <PanelError message={panelErrors.settings} onRetry={() => void refreshCore()} />
+        <dl className="kv">
+          <dt>Runtime</dt>
+          <dd>{runtime ? `${runtime.resolved_runtime.backend} · ${runtime.resolved_runtime.device_label}` : "—"}<span className="hint"> {runtime?.resolved_runtime.detail ?? ""}</span></dd>
+          <dt>GPU in use</dt>
+          <dd>{perf ? (serviceGpus.length ? serviceGpus.map(gpuTitle).join(", ") : "CPU") : "—"}</dd>
+          <dt>NVIDIA cards on host</dt>
+          <dd>{perf && perf.gpus.length ? perf.gpus.map(gpuTitle).join(", ") : runtime?.system.nvidia_gpus?.join(", ") || "—"}</dd>
+          <dt>OpenVINO</dt>
+          <dd>{runtime?.system.openvino_devices?.join(", ") || "—"}</dd>
+          <dt>Platform</dt>
+          <dd>{runtime?.system.platform ?? "—"}</dd>
+          <dt>Idle trim</dt>
+          <dd>{idleTrimText(runtime?.idle_trim)}</dd>
+          <dt>Last runtime error</dt>
+          <dd className={lastError ? "text-danger" : undefined}>{lastError ?? "None"}</dd>
+        </dl>
+        <h3>Loaded models</h3>
         <div className="table-wrap">
-          <table className="model-table">
+          <table>
             <thead>
-              <tr>
-                <th>Model</th>
-                <th>Tier</th>
-                <th>Size</th>
-                <th>Status</th>
-                <th>Path</th>
-                <th>Actions</th>
-              </tr>
+              <tr><th>Model</th><th>Device</th><th>Precision</th><th>Compile</th><th className="num">Max tokens</th><th className="num">Load time</th></tr>
             </thead>
             <tbody>
-              {managedModels.map((model) => {
-                const rowBusy = modelBusyId === model.id;
-                const isDownloading = model.status === "downloading";
-                return (
-                  <tr key={model.id}>
-                    <td>
-                      <strong>{model.label}</strong>
-                      <div className="muted mono model-id">{model.id}</div>
-                      <div className="muted">{model.notes}</div>
-                    </td>
-                    <td>{model.tier}</td>
-                    <td>{formatModelSize(model)}</td>
-                    <td className="model-status-cell">
-                      <strong>{formatModelStatus(model.status)}</strong>
-                      {model.error ? <span className="model-status-error">{model.error}</span> : null}
-                    </td>
-                    <td className="mono model-path-cell">{model.local_path || model.cache_path || model.storage_root}</td>
-                    <td className="model-actions-cell">
-                      <div className="table-actions">
-                        <button type="button" className="secondary-button" onClick={() => void handleDownloadModel(model)} disabled={isDownloading || rowBusy}>
-                          {isDownloading ? "Downloading..." : rowBusy && modelActionKind === "download" ? "Starting..." : model.status === "ready" ? "Download Again" : "Download"}
-                        </button>
-                        <button type="button" className="ghost-button danger-button" onClick={() => void handleDeleteModel(model)} disabled={!model.cache_path || isDownloading || rowBusy}>
-                          {rowBusy && modelActionKind === "delete" ? "Deleting..." : "Delete"}
-                        </button>
-                      </div>
-                    </td>
+              {loadedModels.length === 0 ? (
+                <tr><td colSpan={6} className="empty">No model loaded. The default model loads on the first request.</td></tr>
+              ) : (
+                loadedModels.map((model, index) => (
+                  <tr key={`${model.model_id ?? "model"}-${model.device ?? index}-${model.precision ?? ""}`}>
+                    <td className="wrap"><span className="mono">{model.model_id ?? "—"}</span>{model.model_id === defaultModel ? <span className="badge accent inline-badge">Default</span> : null}</td>
+                    <td>{[model.backend, model.device].filter(Boolean).join(" · ") || "—"}</td>
+                    <td>{[model.precision, model.quantization && model.quantization !== "none" ? model.quantization : null].filter(Boolean).join(" · ") || "—"}</td>
+                    <td className="wrap">{compileText(model)}</td>
+                    <td className="num">{fmtNum(model.max_seq_length ?? null)}</td>
+                    <td className="num">{fmtMs(model.load_duration_ms)}</td>
                   </tr>
-                );
-              })}
+                ))
+              )}
             </tbody>
           </table>
         </div>
       </section>
+    </>
+  );
 
-      <div className="content-grid">
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <span className="eyebrow">History</span>
-              <h2>Latest embeddings</h2>
-            </div>
-          </div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Route</th>
-                  <th>Model</th>
-                  <th>Inputs</th>
-                  <th>Dim</th>
-                  <th>Total</th>
-                  <th>Encode</th>
-                  <th>Batch</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.length === 0 ? (
-                  <tr><td colSpan={9}>No embedding history recorded yet.</td></tr>
-                ) : history.map((entry, index) => (
-                  <tr key={`${entry.timestamp ?? "row"}-${index}`}>
-                    <td>{formatDateTime(entry.timestamp)}</td>
-                    <td>{entry.route ?? "n/a"}</td>
-                    <td className="mono">{entry.model_id ?? "n/a"}</td>
-                    <td>
-                      {formatValue(entry.input_count)} / {formatValue(entry.input_chars)} chars
-                      {entry.input_tokens !== null && entry.input_tokens !== undefined ? ` / ${formatValue(entry.input_tokens)} tokens` : null}
-                      {entry.media ? <div className="muted">{formatMediaCounts(entry.media)}</div> : null}
-                    </td>
-                    <td>{formatValue(entry.dimension)}</td>
-                    <td>{formatValue(entry.total_duration_ms, " ms")}</td>
-                    <td>{formatValue(entry.encode_duration_ms, " ms")}</td>
-                    <td>{entry.batched ? "yes" : "no"}</td>
-                    <td>{entry.success ? "ok" : entry.error ?? "error"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
+  const modelSelect = (value: string, onChange: (value: string) => void, id: string) => (
+    <select id={id} value={value || defaultModel} onChange={(event) => onChange(event.target.value === defaultModel ? "" : event.target.value)}>
+      {settingsOptions.models.map((option) => (
+        <option key={option.value} value={option.value}>{option.label}{option.value === defaultModel ? " (default)" : ""}</option>
+      ))}
+    </select>
+  );
 
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <span className="eyebrow">System</span>
-              <h2>Detected devices</h2>
-            </div>
-          </div>
-          <div className="system-list">
-            <div><span>Platform</span><strong>{runtime?.system.platform ?? "n/a"}</strong></div>
-            <div><span>OpenVINO</span><strong>{runtime?.system.openvino_devices?.join(", ") || "n/a"}</strong></div>
-            <div><span>NVIDIA</span><strong>{runtime?.system.nvidia_gpus?.join(", ") || "n/a"}</strong></div>
-            <div><span>NPU</span><strong>{runtime?.system.windows_npu_devices?.join(", ") || "n/a"}</strong></div>
-            <div><span>Loaded Models</span><strong>{formatValue(runtime?.loaded_models.length ?? 0)}</strong></div>
-            <div><span>Compile</span><strong>{compileSummary(runtime?.loaded_models ?? [])}</strong></div>
-            <div><span>Idle Trim</span><strong>{idleTrimSummary(runtime?.idle_trim)}</strong></div>
-            <div><span>Last Runtime Error</span><strong>{runtime?.last_runtime_error ?? "none"}</strong></div>
-          </div>
-        </section>
+  const playground = (
+    <section className="panel" aria-labelledby="compare-title">
+      <div className="panel-head">
+        <h2 id="compare-title">Compare two texts</h2>
+        <p className="hint">Embeds both texts with the chosen model and compares the vectors. Runs through the same queue as API requests and counts in the history.</p>
       </div>
-    </main>
+      <form className="form-grid" onSubmit={handleCompare}>
+        <Field label="Model" hint={runtime ? `Runs on ${runtime.resolved_runtime.device_label}.` : undefined}>
+          {modelSelect(compareModel, setCompareModel, "compare-model")}
+        </Field>
+        <Field label="Text A" wide>
+          <textarea value={compareTextA} onChange={(event) => setCompareTextA(event.target.value)} rows={5} />
+        </Field>
+        <Field label="Text B" wide>
+          <textarea value={compareTextB} onChange={(event) => setCompareTextB(event.target.value)} rows={5} />
+        </Field>
+        <div className="form-actions field-wide">
+          <button type="submit" disabled={compareBusy || !compareTextA.trim() || !compareTextB.trim()} aria-busy={compareBusy}>
+            {compareBusy ? "Embedding…" : "Run"}
+          </button>
+          {compareResult ? <CopyButton text={JSON.stringify(compareResult.vectors)} label="Copy vectors" className="secondary-button" /> : null}
+        </div>
+      </form>
+      {compareResult ? (
+        <div className="grid grid-auto card-row" aria-live="polite">
+          <Card label="Cosine similarity" value={fmtFixed(compareResult.cosine_similarity, 4)} />
+          <Card label="Dot product" value={fmtFixed(compareResult.dot_product, 4)} />
+          <Card label="Euclidean distance" value={fmtFixed(compareResult.euclidean_distance, 4)} />
+          <Card label="Dimensions" value={fmtNum(compareResult.dimension)} sub={<span className="mono">{compareResult.model_id}</span>} />
+          <Card label="Total time" value={fmtMs(compareResult.total_duration_ms)} sub={`encode ${fmtMs(compareResult.encode_duration_ms)} · load ${fmtMs(compareResult.load_duration_ms)}`} />
+          <Card label="Runtime" value={compareResult.device_label || compareResult.device} sub={`${compareResult.backend} · ${compareResult.batched ? "batched" : "direct"}`} />
+        </div>
+      ) : null}
+    </section>
+  );
+
+  const cachePathDirty = settingsForm.model_cache_path !== saved.model_cache_path;
+  const models = (
+    <section className="panel" aria-labelledby="models-title">
+      <div className="panel-head">
+        <h2 id="models-title">Model cache</h2>
+        <button type="button" className="secondary-button" onClick={() => void handleRefreshModels()} disabled={modelsRefreshing} aria-busy={modelsRefreshing}>
+          {modelsRefreshing ? "Refreshing…" : "Refresh"}
+        </button>
+        <p className="hint">
+          Download or remove supported models in the saved cache path <span className="mono">{saved.model_cache_path || "(Hugging Face default)"}</span>.
+          Downloads use the saved Hugging Face token.
+        </p>
+      </div>
+      {cachePathDirty ? <div className="banner warn">The cache path has unsaved changes in Settings. This list shows the saved path until you save.</div> : null}
+      <PanelError message={panelErrors.settings} onRetry={() => void refreshCore()} />
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Model</th><th>Tier</th><th className="num">Size</th><th>Status</th><th>Path</th><th className="actions"><span className="sr-only">Actions</span></th></tr>
+          </thead>
+          <tbody>
+            {managedModels === null ? <tr><td colSpan={6} className="empty"><span className="spinner" /> Loading…</td></tr> : null}
+            {managedModels !== null && managedModels.length === 0 ? <tr><td colSpan={6} className="empty">No supported models found.</td></tr> : null}
+            {(managedModels ?? []).map((model) => {
+              const busy = modelBusy?.id === model.id;
+              const downloading = model.status === "downloading";
+              return (
+                <tr key={model.id}>
+                  <td className="wrap model-cell">
+                    <strong>{model.label}</strong>{model.id === defaultModel ? <span className="badge accent inline-badge">Default</span> : null}
+                    <div className="mono dim">{model.id}</div>
+                    {model.notes ? <div className="hint">{model.notes}</div> : null}
+                  </td>
+                  <td>{model.tier || "—"}</td>
+                  <td className="num">{modelSize(model)}</td>
+                  <td>
+                    {modelStatusBadge(model.status)}
+                    {model.error ? <div className="field-error">{model.error}</div> : null}
+                  </td>
+                  <td className="wrap"><span className="mono dim">{model.local_path || model.cache_path || model.storage_root || "—"}</span></td>
+                  <td className="actions">
+                    <button type="button" className="secondary-button" onClick={() => void handleDownloadModel(model)} disabled={downloading || busy} aria-busy={busy && modelBusy?.kind === "download"}>
+                      {downloading ? "Downloading…" : busy && modelBusy?.kind === "download" ? "Starting…" : model.status === "ready" ? "Download again" : "Download"}
+                    </button>
+                    <button type="button" className="danger-button" onClick={() => void handleDeleteModel(model)} disabled={!model.cache_path || downloading || busy} aria-busy={busy && modelBusy?.kind === "delete"}>
+                      {busy && modelBusy?.kind === "delete" ? "Deleting…" : "Delete"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+
+  const isDirty = (key: keyof AdminSettings) => (dirtyKeys as Array<keyof AdminSettings>).includes(key);
+  const selectField = (key: "default_model" | "execution_target" | "gpu_device" | "backend_override" | "precision" | "quantization" | "compile_mode" | "too_long_policy", label: string, options: AdminOption[], hint?: string) => (
+    <Field label={label} hint={hint} dirty={isDirty(key)}>
+      <select value={settingsForm[key]} onChange={(event) => updateSetting(key, event.target.value)}>
+        {!options.some((option) => option.value === settingsForm[key]) ? <option value={settingsForm[key]}>{settingsForm[key] || "—"}</option> : null}
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
+    </Field>
+  );
+  const numberField = (key: NumberKey) => {
+    const spec = NUMBER_FIELDS[key];
+    const error = fieldError(key, settingsForm[key]);
+    return (
+      <Field key={key} label={spec.label} hint={`${spec.hint ? `${spec.hint} ` : ""}${fmtNum(spec.min)}–${fmtNum(spec.max)}.`} error={error} dirty={isDirty(key)}>
+        <input
+          type="number"
+          inputMode="numeric"
+          min={spec.min}
+          max={spec.max}
+          step={spec.step ?? 1}
+          value={settingsForm[key]}
+          aria-invalid={error ? true : undefined}
+          onChange={(event) => updateSetting(key, event.target.value === "" ? "" : Number(event.target.value))}
+        />
+      </Field>
+    );
+  };
+  const toggleField = (key: "batching_enabled" | "warmup_on_load" | "encode_token_batching" | "cuda_graphs" | "image_inputs_enabled" | "audio_inputs_enabled" | "video_inputs_enabled", label: string, hint?: string) => (
+    <label className={`switch-row${isDirty(key) ? " field-dirty" : ""}`} key={key}>
+      <input type="checkbox" checked={settingsForm[key]} onChange={(event) => updateSetting(key, event.target.checked)} />
+      <span>
+        <span className="field-label">{label}</span>
+        {hint ? <span className="hint"> {hint}</span> : null}
+      </span>
+    </label>
+  );
+
+  const settingsTab = (
+    <>
+      <section className="panel" aria-labelledby="presets-title">
+        <div className="panel-head">
+          <h2 id="presets-title">Presets</h2>
+          <p className="hint">Built-in GPU tiers plus your saved presets. Loading fills the form below; nothing changes until you save.</p>
+        </div>
+        <div className="form-grid">
+          <Field label="Preset" hint={selectedPreset ? [selectedPreset.description, selectedPreset.note].filter(Boolean).join(" ") || undefined : undefined}>
+            <select value={selectedPreset ? presetChoice : ""} onChange={(event) => setPresetChoice(event.target.value)}>
+              <option value="">Choose a preset…</option>
+              {presets.map((preset) => (
+                <option key={preset.name} value={preset.name}>{preset.built_in ? `${preset.name} (built-in)` : preset.name}</option>
+              ))}
+            </select>
+          </Field>
+          <div className="button-row align-end">
+            <button type="button" className="secondary-button" onClick={handleLoadPreset} disabled={!selectedPreset || presetBusy || saveBusy}>Load into form</button>
+            <button type="button" className="danger-button" onClick={() => void handleDeletePreset()} disabled={!selectedPreset || selectedPreset.built_in || presetBusy}>Delete</button>
+          </div>
+        </div>
+        <form className="form-grid" onSubmit={handleSavePreset}>
+          <Field label="Save the current form as" hint="The cache path and the Hugging Face token are never stored in a preset.">
+            <input value={presetSaveName} maxLength={64} placeholder="Preset name" onChange={(event) => setPresetSaveName(event.target.value)} />
+          </Field>
+          <div className="button-row align-end">
+            <button type="submit" className="secondary-button" disabled={!presetSaveName.trim() || presetBusy || invalidKeys.length > 0} aria-busy={presetBusy}>
+              {presetBusy ? "Saving…" : "Save as preset"}
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <form className="settings-form" onSubmit={(event) => void handleSaveSettings(event)}>
+        <PanelError message={panelErrors.settings} onRetry={() => void refreshCore()} />
+        <section className="panel" aria-labelledby="settings-runtime">
+          <div className="panel-head"><h2 id="settings-runtime">Model and hardware</h2></div>
+          <div className="form-grid">
+            {selectField("default_model", "Default model", settingsOptions.models, "Used when a request names no model.")}
+            {selectField("execution_target", "Target", settingsOptions.execution_targets)}
+            {selectField("gpu_device", "GPU", settingsOptions.gpu_devices, "Numbered like nvidia-smi. Switching reloads the model on the new card; the old card keeps the CUDA context (about 0.5 GB) until restart.")}
+            {selectField("backend_override", "Backend", settingsOptions.backends)}
+            {selectField("precision", "Precision", settingsOptions.precisions)}
+            {selectField("quantization", "Quantization (CUDA)", settingsOptions.quantizations)}
+            {selectField("compile_mode", "Compile", settingsOptions.compile_modes, "torch.compile; the first requests after loading are slower.")}
+          </div>
+          <div className="toggle-grid">
+            {toggleField("cuda_graphs", "CUDA graphs", "EmbeddingGemma 2 only.")}
+            {toggleField("warmup_on_load", "Warm up on load")}
+          </div>
+        </section>
+
+        <section className="panel" aria-labelledby="settings-batching">
+          <div className="panel-head"><h2 id="settings-batching">Batching and limits</h2></div>
+          <div className="toggle-grid">
+            {toggleField("batching_enabled", "Enable batching", "Collect concurrent requests into one GPU pass.")}
+            {toggleField("encode_token_batching", "Pack texts by tokens")}
+          </div>
+          <div className="form-grid">
+            {(["batch_wait_time_ms", "batch_max_texts", "batch_max_chars", "encode_batch_size", "max_seq_length", "idle_trim_seconds"] as NumberKey[]).map(numberField)}
+            {selectField("too_long_policy", "Texts over the token limit", settingsOptions.too_long_policies)}
+          </div>
+        </section>
+
+        <section className="panel" aria-labelledby="settings-storage">
+          <div className="panel-head"><h2 id="settings-storage">Storage and downloads</h2></div>
+          <div className="form-grid">
+            <Field label="Cache path" hint="Folder for downloaded models. Empty = the Hugging Face default cache." dirty={isDirty("model_cache_path")} wide>
+              <input value={settingsForm.model_cache_path} onChange={(event) => updateSetting("model_cache_path", event.target.value)} />
+            </Field>
+            <Field
+              label="Hugging Face token"
+              hint={tokenClear ? "The stored token is removed when you save." : tokenSet ? "A token is stored. Type a new one to replace it." : "Optional. Needed only for gated models."}
+              dirty={tokenDirty}
+              wide
+            >
+              <div className="input-row">
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={tokenInput}
+                  disabled={tokenClear}
+                  placeholder={tokenSet ? `Saved: ${tokenHint ?? "hf_…"} · leave empty to keep` : "hf_…"}
+                  onChange={(event) => setTokenInput(event.target.value)}
+                />
+                {tokenSet || tokenClear ? (
+                  <button type="button" className="ghost-button" onClick={() => { setTokenClear(!tokenClear); setTokenInput(""); }}>
+                    {tokenClear ? "Keep token" : "Clear"}
+                  </button>
+                ) : null}
+              </div>
+            </Field>
+          </div>
+        </section>
+
+        <section className="panel" aria-labelledby="settings-media">
+          <div className="panel-head">
+            <h2 id="settings-media">Media inputs</h2>
+            <p className="hint">Images, audio and video frames for multimodal models. Media requests bypass the batch queue.</p>
+          </div>
+          <div className="toggle-grid">
+            {MEDIA_TOGGLES.map((field) => toggleField(field.key, field.label))}
+          </div>
+          <div className="form-grid">{MEDIA_LIMIT_KEYS.map(numberField)}</div>
+        </section>
+
+        <div className={`save-bar${dirtyCount > 0 ? " is-dirty" : ""}`} role="region" aria-label="Save settings">
+          <span className="save-bar-status">
+            {dirtyCount === 0 ? "No unsaved changes" : `${dirtyCount} unsaved change${dirtyCount === 1 ? "" : "s"}`}
+            {invalidKeys.length > 0 ? <span className="text-danger"> · {invalidKeys.length} invalid</span> : null}
+          </span>
+          <div className="button-row">
+            <button type="button" className="ghost-button" onClick={discardSettings} disabled={dirtyCount === 0 || saveBusy}>Discard</button>
+            <button type="button" className="secondary-button" onClick={() => void reloadSettings()} disabled={saveBusy}>Reload</button>
+            <button type="submit" disabled={dirtyCount === 0 || invalidKeys.length > 0 || saveBusy} aria-busy={saveBusy}>{saveBusy ? "Saving…" : "Save changes"}</button>
+          </div>
+        </div>
+      </form>
+    </>
+  );
+
+  const benchmark = (
+    <section className="panel" aria-labelledby="bench-title">
+      <div className="panel-head">
+        <h2 id="bench-title">Throughput benchmark</h2>
+        <p className="hint">Encodes every input line the given number of times, directly on the model (no queue). The load shows up in Performance on the Dashboard.</p>
+      </div>
+      <form className="form-grid" onSubmit={handleBenchmark}>
+        <Field label="Model">{modelSelect(benchmarkModel, setBenchmarkModel, "bench-model")}</Field>
+        <Field label="Repeats" hint="1–128." error={benchmarkRepeatCount === "" ? "Required." : null}>
+          <input type="number" min={1} max={128} value={benchmarkRepeatCount} onChange={(event) => setBenchmarkRepeatCount(event.target.value === "" ? "" : Number(event.target.value))} />
+        </Field>
+        <Field label="Inputs" hint="One text per line." wide>
+          <textarea value={benchmarkInputs} onChange={(event) => setBenchmarkInputs(event.target.value)} rows={6} />
+        </Field>
+        <div className="form-actions field-wide">
+          <button type="submit" disabled={benchmarkBusy} aria-busy={benchmarkBusy}>{benchmarkBusy ? "Running…" : "Run benchmark"}</button>
+        </div>
+      </form>
+      {benchmarkResult ? (
+        <div className="grid grid-auto card-row" aria-live="polite">
+          <Card label="Throughput" value={fmtRate(benchmarkResult.texts_per_second, "texts/s")} />
+          <Card label="Total time" value={fmtMs(benchmarkResult.total_wall_time_ms)} sub={`${fmtMs(benchmarkResult.avg_wall_time_per_run_ms)} per run`} />
+          <Card label="Texts" value={fmtNum(benchmarkResult.total_texts)} sub={`${fmtNum(benchmarkResult.texts_per_run)} × ${fmtNum(benchmarkResult.repeat_count)} · ${fmtNum(benchmarkResult.total_chars)} characters`} />
+          <Card label="Runtime" value={benchmarkResult.device_label || benchmarkResult.device} sub={<span className="mono">{benchmarkResult.model_id}</span>} />
+        </div>
+      ) : null}
+    </section>
+  );
+
+  const historyTab = (
+    <section className="panel" aria-labelledby="history-title">
+      <div className="panel-head">
+        <h2 id="history-title">Latest requests</h2>
+        <p className="hint">The last {fmtNum(history.length)} embedding requests (API, playground). Payloads are never stored, only counts.</p>
+      </div>
+      <PanelError message={panelErrors.stats} onRetry={() => void refreshCore()} />
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Route</th><th>Model</th><th className="num">Inputs</th><th className="num">Dim.</th><th className="num">Total</th><th className="num">Encode</th><th>Mode</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            {stats === null ? <tr><td colSpan={9} className="empty"><span className="spinner" /> Loading…</td></tr> : null}
+            {stats !== null && history.length === 0 ? <tr><td colSpan={9} className="empty">No requests yet. Run a comparison in Playground or call the API.</td></tr> : null}
+            {history.slice(0, 50).map((entry, index) => (
+              <tr key={`${entry.timestamp ?? "row"}-${index}`}>
+                <td className="nowrap">{fmtDateTime(entry.timestamp, true)}</td>
+                <td className="nowrap mono">{entry.route ?? "—"}</td>
+                <td className="wrap"><span className="mono">{entry.model_id ?? "—"}</span></td>
+                <td className="num">
+                  {fmtNum(entry.input_count ?? null)}
+                  <div className="hint">
+                    {fmtNum(entry.input_chars ?? null)} chars{entry.input_tokens != null ? ` · ${fmtNum(entry.input_tokens)} tokens` : ""}
+                    {entry.media ? ` · ${mediaCounts(entry.media)}` : ""}
+                  </div>
+                </td>
+                <td className="num">{fmtNum(entry.dimension ?? null)}</td>
+                <td className="num">{fmtMs(entry.total_duration_ms)}</td>
+                <td className="num">{fmtMs(entry.encode_duration_ms)}</td>
+                <td>{entry.batched ? "Batched" : "Direct"}</td>
+                <td className="status-cell">
+                  {entry.success ? <span className="badge ok">OK</span> : <span className="badge danger" title={entry.error}>Failed</span>}
+                  {!entry.success && entry.error ? <div className="field-error">{entry.error}</div> : null}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+
+  const origin = window.location.origin;
+  const apiKeysTab = (
+    <ApiKeysPanel
+      keys={apiKeys?.map((key) => ({
+        id: key.id,
+        alias: key.alias,
+        hint: key.hint ?? null,
+        created_at: key.created_at,
+        last_used_at: key.usage.last_used_at,
+        requests: key.usage.request_count,
+        usage: key.usage.total_items_processed,
+      })) ?? null}
+      loadError={panelErrors.keys}
+      usageLabel="Texts"
+      baseUrl={origin}
+      routesText={PUBLIC_ROUTES}
+      exampleCurl={(key) =>
+        `curl -s ${origin}/v1/embeddings \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model": "${defaultModel || "google/embeddinggemma-2"}", "input": ["Hello world"]}'`
+      }
+      onCreate={async (alias) => {
+        try {
+          return await createApiKey(alias);
+        } catch (error) {
+          handleAuthError(error);
+          throw error;
+        }
+      }}
+      onRevoke={async (id) => {
+        try {
+          await deleteApiKey(id);
+        } catch (error) {
+          handleAuthError(error);
+          throw error;
+        }
+      }}
+      onChanged={() => void refreshKeys()}
+    />
+  );
+
+  const account = (
+    <div className="grid grid-2">
+      <section className="panel" aria-labelledby="account-title">
+        <div className="panel-head"><h2 id="account-title">Signed in</h2></div>
+        <dl className="kv">
+          <dt>User</dt>
+          <dd>{currentUser || "—"}</dd>
+          <dt>Session expires</dt>
+          <dd>{fmtDateTime(sessionExpiresAt)}</dd>
+        </dl>
+        <div className="button-row">
+          <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Log out</button>
+        </div>
+      </section>
+      <section className="panel" aria-labelledby="password-title">
+        <div className="panel-head">
+          <h2 id="password-title">Change password</h2>
+          <p className="hint">Changing the password signs out every other session of this user.</p>
+        </div>
+        {passwordForm("Change password")}
+      </section>
+    </div>
+  );
+
+  const content: Record<TabId, ReactNode> = {
+    dashboard,
+    playground,
+    models,
+    settings: settingsTab,
+    benchmark,
+    history: historyTab,
+    "api-keys": null, // always mounted below, so a new key survives tab switches (never logout)
+    account,
+  };
+
+  return (
+    <>
+      <ToastHost />
+      <div className="shell">
+        <header className="app-header">
+          <div className="titles">
+            <p className="eyebrow">G3 GPU service · Admin</p>
+            <h1>{SERVICE_NAME}</h1>
+            <div className="status-strip">
+              <span className="chip"><span className="card-label">State</span>{stateBadge}</span>
+              <span className="chip" title={defaultModel}><span className="card-label">Model</span><span className="value">{defaultModel || "None"}</span></span>
+              <span className="chip" title={serviceGpus.map(gpuTitle).join(", ")}>
+                <span className="card-label">GPU</span>
+                <span className="value">{perf ? (serviceGpus.length ? serviceGpus.map(gpuTitle).join(", ") : "CPU") : "—"}</span>
+              </span>
+              <a className="chip chip-link" href="#api-keys" onClick={(event) => { event.preventDefault(); selectTab("api-keys"); }}>
+                <span className="card-label">API</span>
+                {apiKeys === null ? <span className="value">—</span> : <span className={`badge ${keyCount > 0 ? "ok" : "warn"}`}>{keyCount > 0 ? "Protected" : "Open"}</span>}
+              </a>
+            </div>
+          </div>
+          <div className="actions">
+            <a className="button-link ghost" href="/docs" target="_blank" rel="noreferrer">API docs</a>
+            <button type="button" className="ghost-button" onClick={() => void handleLogout()}>Log out</button>
+          </div>
+        </header>
+
+        <nav className="tab-bar" role="tablist" aria-label="Sections" onKeyDown={onTabKey}>
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              ref={(element) => { tabRefs.current[tab.id] = element; }}
+              type="button"
+              role="tab"
+              id={`tab-${tab.id}`}
+              className="tab-button"
+              aria-selected={activeTab === tab.id}
+              aria-controls={`panel-${tab.id}`}
+              tabIndex={activeTab === tab.id ? 0 : -1}
+              onClick={() => selectTab(tab.id)}
+            >
+              {tab.label}
+              {tab.id === "settings" && dirtyCount > 0 ? <span className="tab-dot" aria-label="unsaved changes" /> : null}
+            </button>
+          ))}
+        </nav>
+
+        <main role="tabpanel" id={`panel-${activeTab}`} aria-labelledby={`tab-${activeTab}`} className="tab-panel">
+          {content[activeTab]}
+          <div hidden={activeTab !== "api-keys"}>{apiKeysTab}</div>
+        </main>
+      </div>
+    </>
   );
 }

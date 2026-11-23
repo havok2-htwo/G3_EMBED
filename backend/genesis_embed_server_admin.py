@@ -34,6 +34,7 @@ from .genesis_embed_server_globals import (
     current_settings,
     embedding_history,
     history_lock,
+    request_counters,
     settings_lock,
 )
 from .genesis_embed_server_hardware import get_system_snapshot, gpu_device_options
@@ -338,6 +339,7 @@ def create_admin_api(app: FastAPI) -> FastAPI:
     async def admin_stats(_: dict[str, str] = Depends(require_admin)):
         with history_lock:
             history_items = list(embedding_history)
+            counters = dict(request_counters)
         durations = [entry.get("total_duration_ms") for entry in history_items if entry.get("total_duration_ms") is not None]
         encode_durations = [entry.get("encode_duration_ms") for entry in history_items if entry.get("encode_duration_ms") is not None]
         text_counts = [entry.get("input_count") for entry in history_items if entry.get("input_count") is not None]
@@ -348,6 +350,9 @@ def create_admin_api(app: FastAPI) -> FastAPI:
                 "avg_total_duration_ms": round(mean(durations), 2) if durations else None,
                 "avg_encode_duration_ms": round(mean(encode_durations), 2) if encode_durations else None,
                 "total_texts": sum(int(value or 0) for value in text_counts),
+                "requests_since_start": counters["requests"],
+                "errors_since_start": counters["errors"],
+                "started_at": counters["started_at"],
             },
             "history": history_items[:50],
             "recent_batches": list(batch_history),

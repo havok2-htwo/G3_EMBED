@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+from datetime import datetime, timezone
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict
@@ -243,6 +244,12 @@ batch_state_lock = threading.RLock()
 current_settings: Dict[str, Any] = {}
 embedding_history = deque(maxlen=HISTORY_MAX_LEN)
 batch_history = deque(maxlen=BATCH_HISTORY_MAX_LEN)
+# Requests and failed requests since the process started (the history above keeps only the latest entries).
+request_counters: Dict[str, Any] = {
+    "requests": 0,
+    "errors": 0,
+    "started_at": datetime.now(timezone.utc).isoformat(),
+}
 
 batch_runtime_state: Dict[str, Any] = {
     "worker_running": False,

@@ -25,6 +25,7 @@ from .genesis_embed_server_globals import (
     embedding_history,
     get_model_spec,
     history_lock,
+    request_counters,
     settings_lock,
 )
 from .genesis_embed_server_media import (
@@ -255,6 +256,9 @@ def _result_to_response(result: EncodeResult, *, batched: bool) -> dict[str, Any
 def _record_history(entry: dict[str, Any]) -> None:
     with history_lock:
         embedding_history.appendleft(entry)
+        request_counters["requests"] += 1
+        if not entry.get("success"):
+            request_counters["errors"] += 1
     log_embedding(entry)
 
 

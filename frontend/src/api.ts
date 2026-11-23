@@ -1,3 +1,5 @@
+import type { PerfSnapshot } from "./PerfPanel";
+
 export type AdminOption = {
   label: string;
   value: string;
@@ -99,7 +101,10 @@ export type RuntimeInfo = {
 };
 
 export type SettingsResponse = {
+  // huggingface_token holds only a masked hint ("hf_…abcd") or ""; the real token never reaches the browser.
   settings: AdminSettings;
+  huggingface_token_set?: boolean;
+  huggingface_token_hint?: string | null;
   options: {
     models: AdminOption[];
     execution_targets: AdminOption[];
@@ -121,6 +126,9 @@ export type StatsResponse = {
     avg_total_duration_ms: number | null;
     avg_encode_duration_ms: number | null;
     total_texts: number;
+    requests_since_start?: number;
+    errors_since_start?: number;
+    started_at?: string | null;
   };
   history: Array<Record<string, unknown>>;
   recent_batches: Array<Record<string, unknown>>;
@@ -179,6 +187,12 @@ export type BenchmarkResponse = {
 export type WhoAmI = {
   username: string;
   must_change_password: boolean;
+  session_expires_at?: string | null;
+};
+
+export type SetupStatus = {
+  setup_required: boolean;
+  default_username: string | null;
 };
 
 export type ApiKeyUsage = {
@@ -190,6 +204,7 @@ export type ApiKeyUsage = {
 export type ApiKeyInfo = {
   id: string;
   alias: string;
+  hint?: string | null;
   created_at: string | null;
   usage: ApiKeyUsage;
 };
@@ -197,6 +212,7 @@ export type ApiKeyInfo = {
 export type CreatedApiKey = {
   id: string;
   alias: string;
+  hint?: string | null;
   created_at: string;
   token: string;
 };
@@ -205,13 +221,25 @@ export type CreatedApiKey = {
  * All admin requests carry the httpOnly session cookie (same-origin). 401 -> not logged
  * in; 403 password_change_required -> forced password change.
  */
-// Errors such as input_too_long return an object detail with a human-readable message.
+// Errors such as input_too_long return an object detail with a human-readable message; FastAPI 422 returns a
+// list of {loc, msg}.
 function describeErrorDetail(detail: unknown): string | undefined {
   if (detail === undefined || detail === null) {
     return undefined;
   }
   if (typeof detail === "string") {
     return detail;
+  }
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => {
+        if (item && typeof item === "object" && "msg" in item) {
+          const loc = Array.isArray((item as { loc?: unknown }).loc) ? (item as { loc: unknown[] }).loc.filter((part) => part !== "body").join(".") : "";
+          return loc ? `${loc}: ${String((item as { msg: unknown }).msg)}` : String((item as { msg: unknown }).msg);
+        }
+        return JSON.stringify(item);
+      })
+      .join("; ");
   }
   if (typeof detail === "object" && "message" in detail) {
     return String((detail as { message: unknown }).message);
@@ -247,6 +275,9 @@ async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
     };
     throw new Error(describeErrorDetail(payload.detail) ?? `HTTP ${response.status}`);
   }
+  if (response.status === 204) {
+    return undefined as T;
+  }
 
   return response.json() as Promise<T>;
 }
@@ -266,6 +297,14 @@ export async function whoami() {
   return requestJson<WhoAmI>("/api/admin/auth/whoami", { method: "GET" });
 }
 
+export async function getSetupStatus() {
+  return requestJson<SetupStatus>("/api/admin/auth/setup", { method: "GET" });
+}
+
+export async function getPerf(signal?: AbortSignal) {
+  return requestJson<PerfSnapshot>("/api/admin/perf", { method: "GET", signal });
+}
+
 export async function changePassword(currentPassword: string, newPassword: string) {
   return requestJson<{ ok: boolean; must_change_password: boolean }>("/api/admin/auth/change-password", {
     method: "POST",
@@ -273,8 +312,8 @@ export async function changePassword(currentPassword: string, newPassword: strin
   });
 }
 
-export async function listApiKeys() {
-  return requestJson<{ keys: ApiKeyInfo[] }>("/api/admin/api-keys", { method: "GET" });
+export async function listApiKeys(signal?: AbortSignal) {
+  return requestJson<{ keys: ApiKeyInfo[] }>("/api/admin/api-keys", { method: "GET", signal });
 }
 
 export async function createApiKey(alias: string) {
@@ -285,14 +324,18 @@ export async function createApiKey(alias: string) {
 }
 
 export async function deleteApiKey(id: string) {
-  return requestJson<{ ok: boolean }>(`/api/admin/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+  return requestJson<void>(`/api/admin/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
-export async function getSettings() {
-  return requestJson<SettingsResponse>("/api/admin/settings", { method: "GET" });
+export async function getSettings(signal?: AbortSignal) {
+  return requestJson<SettingsResponse>("/api/admin/settings", { method: "GET", signal });
 }
 
-export async function saveSettings(settings: AdminSettings) {
+// Only the fields to change: an omitted field keeps its stored value. huggingface_token: a new token, or omit it
+// to keep the stored one; clear_huggingface_token removes it.
+export type SettingsUpdate = Partial<AdminSettings> & { clear_huggingface_token?: boolean };
+
+export async function saveSettings(settings: SettingsUpdate) {
   return requestJson<SettingsResponse & { ok: boolean }>("/api/admin/settings", {
     method: "PUT",
     body: JSON.stringify(settings),
@@ -315,7 +358,7 @@ export async function listPresets() {
   return requestJson<{ presets: SettingsPreset[] }>("/api/admin/settings/presets", { method: "GET" });
 }
 
-export async function savePreset(name: string, values: AdminSettings) {
+export async function savePreset(name: string, values: Partial<AdminSettings>) {
   return requestJson<{ ok: boolean; preset: SettingsPreset }>(`/api/admin/settings/presets/${encodeURIComponent(name)}`, {
     method: "PUT",
     body: JSON.stringify({ values }),
@@ -330,41 +373,35 @@ export async function getSystem() {
   return requestJson<{ system: RuntimeInfo["system"]; runtime: RuntimeInfo }>("/api/admin/system", { method: "GET" });
 }
 
-export async function getModels(storagePath?: string) {
-  const query = storagePath !== undefined ? `?storage_path=${encodeURIComponent(storagePath)}` : "";
-  return requestJson<{ models: ManagedModel[] }>(`/api/admin/models${query}`, { method: "GET" });
+// Model list, download and delete always use the SAVED cache path and Hugging Face token (the backend fills them
+// in), never unsaved form values.
+export async function getModels(signal?: AbortSignal) {
+  return requestJson<{ models: ManagedModel[] }>("/api/admin/models", { method: "GET", signal });
 }
 
-export async function downloadModel(modelId: string, storagePath: string, huggingfaceToken?: string) {
+export async function downloadModel(modelId: string) {
   return requestJson<{ job: Record<string, unknown>; models: ManagedModel[] }>("/api/admin/models/download", {
     method: "POST",
-    body: JSON.stringify({
-      model_id: modelId,
-      storage_path: storagePath,
-      huggingface_token: huggingfaceToken,
-    }),
+    body: JSON.stringify({ model_id: modelId }),
   });
 }
 
-export async function deleteModel(modelId: string, storagePath: string) {
+export async function deleteModel(modelId: string) {
   return requestJson<{ ok: boolean; removed: boolean; removed_path: string | null; storage_root: string; models: ManagedModel[] }>(
     "/api/admin/models/delete",
     {
       method: "POST",
-      body: JSON.stringify({
-        model_id: modelId,
-        storage_path: storagePath,
-      }),
+      body: JSON.stringify({ model_id: modelId }),
     },
   );
 }
 
-export async function getStats() {
-  return requestJson<StatsResponse>("/api/admin/stats", { method: "GET" });
+export async function getStats(signal?: AbortSignal) {
+  return requestJson<StatsResponse>("/api/admin/stats", { method: "GET", signal });
 }
 
-export async function getQueue() {
-  return requestJson<QueueResponse>("/api/admin/queue", { method: "GET" });
+export async function getQueue(signal?: AbortSignal) {
+  return requestJson<QueueResponse>("/api/admin/queue", { method: "GET", signal });
 }
 
 export async function compareTexts(model: string, textA: string, textB: string) {
