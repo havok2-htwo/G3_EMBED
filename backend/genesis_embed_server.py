@@ -4,13 +4,13 @@ import asyncio
 import sys
 import threading
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Union
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from .genesis_embed_server_admin import create_admin_api
 from .genesis_embed_server_api import RequestBodyLimitMiddleware, create_api, request_validation_exception_handler
@@ -99,119 +99,129 @@ def _frontend_index_response() -> Union[HTMLResponse, FileResponse]:
     if index_path.exists():
         return FileResponse(index_path)
     return HTMLResponse(
-        """
-        <html>
-          <head><title>G3_EMBED</title></head>
-          <body style="font-family: sans-serif; padding: 32px;">
-            <h1>Frontend build missing</h1>
-            <p>Run <code>npm install</code> and <code>npm run build</code> inside <code>frontend</code>.</p>
-          </body>
-        </html>
-        """,
+        """<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>G3 Embed</title></head>
+  <body style="font-family: system-ui, sans-serif; padding: 32px;">
+    <h1>Admin UI build missing</h1>
+    <p>Run <code>npm ci</code> and <code>npm run build</code> inside <code>frontend</code>, then reload.</p>
+  </body>
+</html>
+""",
         status_code=503,
     )
 
 
+_LANDING_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>G3 Embed</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #10161c; --text: #ebf0df; --text-strong: #faf7ef; --text-dim: #a9b2b8;
+        --panel: rgba(15, 23, 29, .82); --panel-border: rgba(255, 248, 224, .12);
+        --accent: #ffc16c; --accent-strong: #ff8b47; --line-strong: rgba(255, 255, 255, .16);
+        --surface-hover: rgba(255, 255, 255, .08); --text-on-accent: #1b1510;
+        --bg-image: radial-gradient(circle at top left, rgba(255, 194, 117, .20), transparent 28%),
+          radial-gradient(circle at top right, rgba(139, 230, 192, .16), transparent 24%),
+          linear-gradient(145deg, #182028, #10161c 45%, #17131c);
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          color-scheme: light;
+          --bg: #f5f1e8; --text: #1f272d; --text-strong: #11171b; --text-dim: #56626b;
+          --panel: rgba(255, 255, 255, .86); --panel-border: rgba(31, 39, 45, .12);
+          --accent: #ffb24d; --accent-strong: #e8661f; --line-strong: rgba(31, 39, 45, .20);
+          --surface-hover: rgba(31, 39, 45, .07);
+          --bg-image: radial-gradient(circle at top left, rgba(255, 170, 90, .22), transparent 30%),
+            radial-gradient(circle at top right, rgba(90, 200, 160, .18), transparent 26%),
+            linear-gradient(145deg, #faf6ee, #f2eee5 45%, #f4eff3);
+        }
+      }
+      * { box-sizing: border-box; }
+      html { background: var(--bg); }
+      body {
+        margin: 0; min-height: 100vh; color: var(--text); background: var(--bg-image); background-attachment: fixed;
+        font-family: Bahnschrift, "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+        font-size: 1rem; line-height: 1.5;
+      }
+      main { width: min(880px, calc(100vw - 32px)); margin: 0 auto; padding: 56px 0; }
+      section {
+        display: grid; gap: 16px; padding: 24px; border-radius: 24px;
+        background: var(--panel); border: 1px solid var(--panel-border);
+        box-shadow: 0 28px 60px rgba(0, 0, 0, .28); backdrop-filter: blur(18px);
+      }
+      .eyebrow { margin: 0; color: var(--accent); font-size: .75rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+      h1 {
+        margin: 0; color: var(--text-strong); line-height: 1.2;
+        font-family: Rockwell, "Roboto Slab", Bahnschrift, "Segoe UI Variable", system-ui, sans-serif;
+        font-size: clamp(1.75rem, 1.25rem + 1.5vw, 2.25rem);
+      }
+      p { margin: 0; color: var(--text-dim); }
+      code { font-family: "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace; font-size: .9em; color: var(--text-strong); }
+      .button-row { display: flex; gap: 12px; flex-wrap: wrap; }
+      a {
+        display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 20px;
+        border-radius: 999px; text-decoration: none; font-size: .875rem; font-weight: 700; letter-spacing: .02em;
+      }
+      .primary { background: linear-gradient(135deg, var(--accent), var(--accent-strong)); color: var(--text-on-accent); }
+      .secondary { color: var(--text-strong); border: 1px solid var(--line-strong); background: var(--surface-hover); }
+      a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <p class="eyebrow">G3 GPU service</p>
+        <h1>G3 Embed</h1>
+        <p>
+          Local text and media embeddings. <code>POST /embed</code>, <code>POST /v1/embeddings</code> and
+          <code>GET /v1/models</code> are open while no API key exists. Once an API key is created in the admin
+          dashboard, these routes require <code>Authorization: Bearer &lt;key&gt;</code> or
+          <code>X-API-Key: &lt;key&gt;</code>. The admin dashboard is protected by a username and password.
+        </p>
+        <div class="button-row">
+          <a class="primary" href="/admin">Open admin dashboard</a>
+          <a class="secondary" href="/docs">API docs</a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
+"""
+
+
 def _landing_response() -> HTMLResponse:
-    return HTMLResponse(
-        """
-        <html lang="de">
-          <head>
-            <meta charset="utf-8" />
-            <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>G3_EMBED</title>
-            <style>
-              :root {
-                color-scheme: light;
-                font-family: "Bahnschrift", "Segoe UI Variable", "Trebuchet MS", sans-serif;
-                color: #ebf0df;
-                background: #141a20;
-              }
-              body {
-                margin: 0;
-                min-height: 100vh;
-                background:
-                  radial-gradient(circle at top left, rgba(255, 194, 117, 0.22), transparent 28%),
-                  radial-gradient(circle at top right, rgba(139, 230, 192, 0.18), transparent 24%),
-                  linear-gradient(145deg, #182028 0%, #10161c 50%, #17131c 100%);
-              }
-              main {
-                width: min(980px, calc(100vw - 40px));
-                margin: 0 auto;
-                padding: 56px 0;
-              }
-              section {
-                background: rgba(15, 23, 29, 0.82);
-                border: 1px solid rgba(255, 248, 224, 0.12);
-                border-radius: 28px;
-                padding: 28px;
-                box-shadow: 0 28px 60px rgba(0, 0, 0, 0.28);
-                backdrop-filter: blur(18px);
-              }
-              .eyebrow {
-                display: inline-block;
-                margin-bottom: 0.8rem;
-                color: #95f2c7;
-                font-size: 0.75rem;
-                font-weight: 800;
-                letter-spacing: 0.18em;
-                text-transform: uppercase;
-              }
-              h1 {
-                margin: 0 0 1rem;
-                font-family: "Rockwell", "Bahnschrift", serif;
-                font-size: clamp(2rem, 4vw, 3.4rem);
-                line-height: 1.02;
-              }
-              p { color: #a9b2b8; line-height: 1.6; }
-              code { color: #f8e7c3; }
-              .button-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 24px; }
-              a {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                min-width: 220px;
-                border-radius: 999px;
-                text-decoration: none;
-                padding: 0.9rem 1.25rem;
-                font-weight: 700;
-                letter-spacing: 0.02em;
-              }
-              .primary {
-                background: linear-gradient(135deg, #ffc16c, #ff8b47);
-                color: #1b1510;
-                box-shadow: 0 12px 28px rgba(255, 139, 71, 0.25);
-              }
-              .secondary {
-                color: #f4f6ee;
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                background: rgba(255, 255, 255, 0.06);
-              }
-            </style>
-          </head>
-          <body>
-            <main>
-              <section>
-                <span class="eyebrow">G3_EMBED</span>
-                <h1>Lokale Text-Embeddings offen, Admin-Dashboard geschuetzt.</h1>
-                <p>
-                  Die oeffentliche API unter <code>POST /embed</code> und <code>POST /v1/embeddings</code> ist ohne
-                  Key erreichbar, solange keine API-Keys angelegt sind. Sobald im Admin-Dashboard mindestens ein
-                  API-Key existiert, wird ein <code>X-API-Key</code>-Header verlangt. Das Admin-Dashboard unter
-                  <code>/admin</code> ist per Login (Benutzername/Passwort, Standard <code>admin</code> /
-                  <code>admin</code>, Wechsel beim ersten Login) geschuetzt.
-                </p>
-                <div class="button-row">
-                  <a class="primary" href="/admin">Admin-Dashboard oeffnen</a>
-                  <a class="secondary" href="/docs">OpenAPI / Docs</a>
-                </div>
-              </section>
-            </main>
-          </body>
-        </html>
-        """,
-        status_code=200,
-    )
+    return HTMLResponse(_LANDING_HTML, status_code=200)
+
+
+def _resolve_frontend_asset(full_path: str) -> Path | None:
+    """File under frontend/dist for full_path, or None (never a file outside dist).
+
+    The path is checked lexically before the filesystem is touched: on Windows, dist / "//host/share/x" is a UNC
+    path, and resolving it would open an SMB connection to that host. Backslashes, drive letters / colons,
+    absolute paths and '..' never reach the filesystem; symlinks that point outside dist are never served.
+    """
+    if not full_path or "\x00" in full_path or "\\" in full_path or ":" in full_path:
+        return None
+    relative = PurePosixPath(full_path)
+    if relative.is_absolute() or full_path.startswith("/") or ".." in relative.parts:
+        return None
+    parts = [part for part in relative.parts if part not in {"", "."}]
+    if not parts:
+        return None
+    try:
+        dist_root = FRONTEND_DIST_DIR.resolve(strict=True)
+        candidate = dist_root.joinpath(*parts).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not candidate.is_relative_to(dist_root) or not candidate.is_file():
+        return None
+    return candidate
 
 
 @app.get("/")
@@ -227,12 +237,13 @@ async def serve_frontend_index():
 
 @app.get("/{full_path:path}")
 async def serve_frontend_assets(full_path: str):
-    if full_path.startswith("api/"):
-        return HTMLResponse(status_code=404, content="Not Found")
+    if full_path.startswith(("api/", "v1/")) or full_path in {"api", "v1"}:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
     if full_path.startswith("admin/"):
-        return _frontend_index_response()
-    asset_path = FRONTEND_DIST_DIR / full_path
-    if asset_path.exists() and asset_path.is_file():
+        asset_path = _resolve_frontend_asset(full_path.removeprefix("admin/"))
+        return FileResponse(asset_path) if asset_path is not None else _frontend_index_response()
+    asset_path = _resolve_frontend_asset(full_path)
+    if asset_path is not None:
         return FileResponse(asset_path)
     return _landing_response()
 
