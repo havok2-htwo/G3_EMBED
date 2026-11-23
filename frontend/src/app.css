@@ -17,9 +17,6 @@
 
 /* ---------- header ---------- */
 .app-header .titles { min-width: 0; }
-.chip-link { text-decoration: none; cursor: pointer; }
-.chip-link:hover { background: var(--surface-hover); }
-.status-strip .chip .badge { font-size: var(--fs-xs); }
 .tab-panel { display: grid; gap: var(--sp-5); min-width: 0; }
 .tab-panel > [hidden] { display: none; }
 .tab-button { position: relative; }

@@ -1376,9 +1376,9 @@ export default function App() {
   const account = (
     <div className="grid grid-2">
       <section className="panel" aria-labelledby="account-title">
-        <div className="panel-head"><h2 id="account-title">Signed in</h2></div>
+        <div className="panel-head"><h2 id="account-title">Account</h2></div>
         <dl className="kv">
-          <dt>User</dt>
+          <dt>Signed in as</dt>
           <dd>{currentUser || "—"}</dd>
           <dt>Session expires</dt>
           <dd>{fmtDateTime(sessionExpiresAt)}</dd>
@@ -1417,7 +1417,7 @@ export default function App() {
             <p className="eyebrow">G3 GPU service · Admin</p>
             <h1>{SERVICE_NAME}</h1>
             <div className="status-strip">
-              <span className="chip"><span className="card-label">State</span>{stateBadge}</span>
+              {stateBadge}
               <span className="chip" title={defaultModel}><span className="card-label">Model</span><span className="value">{defaultModel || "None"}</span></span>
               <span className="chip" title={serviceGpus.map(gpuTitle).join(", ")}>
                 <span className="card-label">GPU</span>

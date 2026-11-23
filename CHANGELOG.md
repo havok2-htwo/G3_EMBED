@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Performance graph axis labels: ticks print the decimals they need (`0.25`, `1.25`, `2.8 GB`, no more `0.3` or `13` for 12.5), integer axes step 1/2/5 (queue peak 5 gives 0/2/4/6 instead of only 0 and 5), and rate charts no longer repeat the unit in the title. Header chips (state badge, clickable API chip) and the Account tab (Account panel first, then Change password; "Set a new password" on first login) look the same in all four G3 services.
 - Admin UI harmonised with the other G3 services (G3 admin standard): header with status chips (state, model,
   GPU, API Open/Protected), tabs (Dashboard, Playground, Models, Settings, Benchmark, History, API keys, Account),
   shared tokens for colours, type scale and radii, dark and light theme, toasts, English text and en-US numbers.
