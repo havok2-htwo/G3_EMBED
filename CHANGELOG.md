@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Docker: the image now matches production: PyTorch 2.11.0 + torchvision 0.26.0 from the CUDA 12.8 wheel index (build arg `TORCH_INDEX_URL`, `https://download.pytorch.org/whl/cpu` for a CPU-only image) instead of CPU-only torch, so the container runs EmbeddingGemma 2 bf16 with CUDA graphs like the native install; OpenVINO stays for the CPU/Intel targets, build-essential for `compile_mode`, healthcheck start period 300 s. New `docker-compose.yml` (project `g3-embed`, port 8777, volumes for `/app/models` and `/app/logs`, NVIDIA GPU reservation, optional `.env`, `/health` check) and a Docker section in the README.
 - Performance graph axis labels: ticks print the decimals they need (`0.25`, `1.25`, `2.8 GB`, no more `0.3` or `13` for 12.5), integer axes step 1/2/5 (queue peak 5 gives 0/2/4/6 instead of only 0 and 5), and rate charts no longer repeat the unit in the title. Header chips (state badge, clickable API chip) and the Account tab (Account panel first, then Change password; "Set a new password" on first login) look the same in all four G3 services.
 - Admin UI harmonised with the other G3 services (G3 admin standard): header with status chips (state, model,
   GPU, API Open/Protected), tabs (Dashboard, Playground, Models, Settings, Benchmark, History, API keys, Account),

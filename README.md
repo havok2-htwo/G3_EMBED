@@ -63,6 +63,23 @@ Default URLs:
 - OpenAPI docs: `http://127.0.0.1:8777/docs`
 - Native API: `POST http://127.0.0.1:8777/embed`
 
+## Docker
+
+Linux host with Docker Engine, Compose v2 (>= 2.24.0) and the NVIDIA Container Toolkit:
+
+```bash
+echo "HUGGINGFACE_TOKEN=hf_..." > .env   # optional: only for gated models (also settable in the dashboard)
+docker compose up -d --build
+```
+
+The image uses the same PyTorch build as the native install (torch 2.11.0 + torchvision 0.26.0, CUDA 12.8 wheels; the host driver comes from the NVIDIA Container Toolkit), so the first start applies the `24GB VRAM` preset and runs EmbeddingGemma 2 in bf16 with CUDA graphs on the GPU. OpenVINO stays installed for the CPU/Intel targets. `docker-compose.yml` reserves the NVIDIA GPU like the other G3 services, publishes port `8777`, keeps models in the `embed_models` volume (`/app/models`) and settings, keys and logs in `embed_logs` (`/app/logs`), and checks `/health` (start period 300 s for load, warmup and graph capture). The image ships no models; download them from the dashboard (Models).
+
+CPU-only host: remove the `deploy:` block from `docker-compose.yml` and build with the CPU wheels (much smaller image):
+
+```bash
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu docker compose up -d --build
+```
+
 ## Admin Login and Client API Keys
 
 Admin users log in at `/admin` with a username and password. The default first-run login is `admin` / `admin`, and the server requires changing that password before protected admin actions are available.

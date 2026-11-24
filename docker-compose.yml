@@ -1,0 +1,54 @@
+# G3_EMBED — embedding service (:8777) as one GPU container.
+#
+#   echo "HUGGINGFACE_TOKEN=hf_..." > .env   # optional: only for gated models (also settable in the dashboard)
+#   docker compose up -d --build
+#
+# Host needs: Docker Engine + Compose v2 (>= 2.24.0) and the NVIDIA Container Toolkit. The GPU can be shared with
+# the other G3 services (Whisper :7861, OmniVoice :8091, RERANK :8778). The first start applies the "24GB VRAM"
+# preset (EmbeddingGemma 2 bf16, CUDA graphs). Models are downloaded from the admin dashboard into the named volume.
+# Admin UI login is username/password (default admin/admin, forced change on first login).
+#
+# CPU-only (no NVIDIA host): remove the deploy: block below and build with the CPU torch wheels:
+#   TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu docker compose up -d --build
+
+name: g3-embed
+
+services:
+  embed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}
+    image: g3-embed:latest
+    container_name: g3-embed
+    restart: unless-stopped
+    ports:
+      - "8777:8777"
+    env_file:
+      - path: .env
+        required: false
+    # Optional: NVML lists host PIDs, so the dashboard's per-process VRAM stays empty inside the container's own
+    # PID namespace (card totals and torch allocator stats still work). Sharing the host PID namespace fixes that
+    # at the cost of isolation:
+    # pid: host
+    volumes:
+      - embed_models:/app/models
+      - embed_logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8777/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 5
+
+volumes:
+  embed_models:
+  embed_logs:
